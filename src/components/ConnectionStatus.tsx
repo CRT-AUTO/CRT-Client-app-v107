@@ -150,10 +150,10 @@ const ConnectionStatus: React.FC<ConnectionStatusProps> = ({ onRetry }) => {
     checkSupabaseConnection();
     
     // Check connection periodically with exponential backoff
-    // Start with higher delay (30 seconds), then increase exponentially with each retry
+    // Start with higher delay (60 seconds), then increase exponentially with each retry
     const getRetryDelay = () => {
-      // Base delay is 30 seconds
-      const baseDelay = 30000; // Increased from 5000 to reduce frequency
+      // Base delay is 60 seconds - increased to reduce frequency
+      const baseDelay = 60000;
       // Max delay is 5 minutes
       const maxDelay = 300000; // 5 minutes
       
