@@ -4,9 +4,11 @@ import { supabase } from '../lib/supabase';
 import { getSocialConnections, getWebhookConfigsByUserId } from '../lib/api';
 import { logout } from '../lib/auth';
 import { checkFacebookLoginStatus, loginWithFacebook } from '../lib/facebookAuth';
+import { waitForFacebookSDK, isFacebookSDKReady } from '../lib/facebookSdk';
 import type { SocialConnection, WebhookConfig } from '../types';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorAlert from '../components/ErrorAlert';
+import FacebookLoginButton from '../components/FacebookLoginButton';
 
 export default function Settings() {
   const [socialConnections, setSocialConnections] = useState<SocialConnection[]>([]);
@@ -82,82 +84,51 @@ export default function Settings() {
     try {
       addFbDebugInfo("Starting Facebook connection process");
       
-      // Check if FB SDK is loaded correctly
-      if (typeof window.FB === 'undefined') {
-        addFbDebugInfo("Facebook SDK not loaded, trying direct OAuth flow");
+      // Check if FB SDK is properly loaded
+      const isSdkReady = isFacebookSDKReady();
+      addFbDebugInfo(`Facebook SDK status: ${isSdkReady ? 'Ready' : 'Not Ready'}`);
+      
+      if (!isSdkReady) {
+        // Wait for the SDK to initialize
+        addFbDebugInfo("Waiting for Facebook SDK to initialize...");
         
-        // Direct to OAuth flow
-        // IMPORTANT: Use the fixed redirect URL that matches your Meta app configuration
-        const redirectUri = `https://crt-tech.org/oauth/facebook/callback`;
-        const appId = import.meta.env.VITE_META_APP_ID;
-        
-        if (!appId) {
-          throw new Error('Facebook App ID is missing in environment variables');
-        }
-        
-        // Save the current auth session in localStorage before redirecting
         try {
-          const { data: { session } } = await supabase.auth.getSession();
-          if (session) {
-            // Store a minimal version of the session to maintain auth state
-            localStorage.setItem('fb_auth_state', JSON.stringify({
-              userId: session.user.id,
-              expiresAt: session.expires_at,
-              timestamp: Date.now()
-            }));
-            addFbDebugInfo("Saved authentication state to localStorage");
-          }
-        } catch (sessionError) {
-          addFbDebugInfo(`Error saving auth state: ${sessionError instanceof Error ? sessionError.message : 'Unknown error'}`);
+          await waitForFacebookSDK(5000); // Wait up to 5 seconds
+          addFbDebugInfo("Facebook SDK initialized successfully");
+        } catch (sdkError) {
+          addFbDebugInfo(`SDK initialization failed: ${sdkError instanceof Error ? sdkError.message : 'Unknown error'}`);
+          // Fall back to direct OAuth flow
+          handleDirectOAuthFlow();
+          return;
         }
-        
-        addFbDebugInfo(`Redirecting to Facebook OAuth URL with fixed redirect: ${redirectUri}`);
-        window.location.href = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=public_profile,email,pages_show_list,pages_messaging&response_type=code`;
-        return;
       }
       
-      // If FB SDK is loaded, use it to initiate login
-      addFbDebugInfo("Facebook SDK loaded, checking login status");
+      // Check login status now that we know SDK is ready
+      addFbDebugInfo("Checking Facebook login status");
       const statusResponse = await checkFacebookLoginStatus();
+      
+      addFbDebugInfo(`Facebook status: ${statusResponse.status}`);
       
       if (statusResponse.status === 'connected' && statusResponse.authResponse) {
         // User is already logged into Facebook and authorized the app
         addFbDebugInfo("User already connected to Facebook, proceeding to page selection");
-        
-        try {
-          // Save the current auth session in localStorage before redirecting
-          const { data: { session } } = await supabase.auth.getSession();
-          if (session) {
-            localStorage.setItem('fb_auth_state', JSON.stringify({
-              userId: session.user.id,
-              expiresAt: session.expires_at,
-              timestamp: Date.now()
-            }));
-            addFbDebugInfo("Saved authentication state to localStorage");
-          }
-        } catch (sessionError) {
-          addFbDebugInfo(`Error saving auth state: ${sessionError instanceof Error ? sessionError.message : 'Unknown error'}`);
-        }
-        
-        // Redirect to the OAuth flow to complete the process
-        // IMPORTANT: Use the fixed redirect URL that matches your Meta app configuration
-        const redirectUri = `https://crt-tech.org/oauth/facebook/callback`;
-        const appId = import.meta.env.VITE_META_APP_ID;
-        
-        if (!appId) {
-          throw new Error('Facebook App ID is missing in environment variables');
-        }
-        
-        addFbDebugInfo(`Redirecting to Facebook OAuth flow with fixed redirect: ${redirectUri}`);
-        window.location.href = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=public_profile,email,pages_show_list,pages_messaging&response_type=code`;
+        // The handleFacebookStatusChange function will handle the redirect
+        await loginWithFacebook();
+      } else if (statusResponse.status === 'error') {
+        // SDK error occurred, fall back to direct OAuth
+        addFbDebugInfo("Facebook SDK error, falling back to direct OAuth");
+        handleDirectOAuthFlow();
       } else {
         // User needs to log in or authorize the app
-        addFbDebugInfo(`Facebook status: ${statusResponse.status}, initiating login flow`);
+        addFbDebugInfo(`Initiating login flow (status: ${statusResponse.status})`);
         
         const loginResponse = await loginWithFacebook();
         
         if (loginResponse.status === 'connected') {
           addFbDebugInfo("Facebook login successful, redirect should happen automatically");
+        } else if (loginResponse.status === 'error') {
+          addFbDebugInfo("Error during Facebook login, falling back to direct OAuth");
+          handleDirectOAuthFlow();
         } else {
           addFbDebugInfo(`Facebook login was not successful: ${loginResponse.status}`);
           throw new Error(`Facebook login failed: ${loginResponse.status}`);
@@ -167,14 +138,64 @@ export default function Settings() {
       console.error('Error connecting to Facebook:', err);
       addFbDebugInfo(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
       setError(err instanceof Error ? err.message : 'Failed to connect to Facebook');
+      
+      // Fall back to direct OAuth as a last resort
+      handleDirectOAuthFlow();
     } finally {
       setFbConnecting(false);
     }
   };
 
+  // Helper function for direct OAuth flow
+  const handleDirectOAuthFlow = async () => {
+    addFbDebugInfo("Using direct OAuth flow");
+    
+    // Save the current auth session in localStorage before redirecting
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session) {
+        // Store a minimal version of the session to maintain auth state
+        localStorage.setItem('fb_auth_state', JSON.stringify({
+          userId: session.user.id,
+          expiresAt: session.expires_at,
+          timestamp: Date.now()
+        }));
+        addFbDebugInfo("Saved authentication state to localStorage");
+      }
+    } catch (sessionError) {
+      addFbDebugInfo(`Error saving auth state: ${sessionError instanceof Error ? sessionError.message : 'Unknown error'}`);
+    }
+    
+    // IMPORTANT: Use the fixed redirect URL that matches your Meta app configuration
+    const redirectUri = `https://crt-tech.org/oauth/facebook/callback`;
+    const appId = window.ENV?.META_APP_ID;
+    
+    if (!appId) {
+      throw new Error('Facebook App ID is missing in environment variables');
+    }
+    
+    addFbDebugInfo(`Redirecting to Facebook OAuth URL with fixed redirect: ${redirectUri}`);
+    window.location.href = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=public_profile,email,pages_show_list,pages_messaging&response_type=code`;
+  };
+
   const handleInstagramConnect = () => {
-    const redirectUri = `${window.location.origin}/oauth/instagram/callback`;
-    window.location.href = `https://api.instagram.com/oauth/authorize?client_id=${import.meta.env.VITE_META_APP_ID}&redirect_uri=${redirectUri}&scope=instagram_basic,instagram_manage_messages&response_type=code`;
+    // Save the current auth session in localStorage before redirecting
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session) {
+        // Store a minimal version of the session to maintain auth state
+        localStorage.setItem('fb_auth_state', JSON.stringify({
+          userId: session.user.id,
+          expiresAt: session.expires_at,
+          timestamp: Date.now()
+        }));
+      }
+      
+      const redirectUri = `${window.location.origin}/oauth/instagram/callback`;
+      window.location.href = `https://api.instagram.com/oauth/authorize?client_id=${window.ENV?.META_APP_ID}&redirect_uri=${redirectUri}&scope=instagram_basic,instagram_manage_messages&response_type=code`;
+    }).catch(error => {
+      console.error('Error getting session:', error);
+      setError('Failed to prepare for Instagram connection');
+    });
   };
   
   const handleDisconnectSocial = async (connectionId: string) => {
@@ -356,23 +377,42 @@ export default function Settings() {
                   </div>
                 ) : (
                   <div className="p-4">
-                    <button
-                      onClick={handleFacebookConnect}
-                      disabled={fbConnecting}
-                      className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
-                    >
-                      {fbConnecting ? (
-                        <>
-                          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
-                          Connecting...
-                        </>
-                      ) : (
-                        <>
-                          <Facebook className="h-5 w-5 mr-2" />
-                          Connect Facebook Page
-                        </>
-                      )}
-                    </button>
+                    <div className="mb-4">
+                      <FacebookLoginButton 
+                        onLoginSuccess={() => console.log('Facebook login successful')} 
+                        onLoginFailure={(err) => {
+                          setError(err);
+                          addFbDebugInfo(`Login failure: ${err}`);
+                        }}
+                        scope="public_profile,email,pages_show_list,pages_messaging"
+                      />
+                    </div>
+                    
+                    <div className="text-center mt-3">
+                      <span className="inline-block border-t border-gray-300 w-full relative">
+                        <span className="px-2 bg-white relative -top-3 text-xs text-gray-500">or</span>
+                      </span>
+                    </div>
+                    
+                    <div className="mt-3 text-center">
+                      <button
+                        onClick={handleFacebookConnect}
+                        disabled={fbConnecting}
+                        className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
+                      >
+                        {fbConnecting ? (
+                          <>
+                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                            Connecting...
+                          </>
+                        ) : (
+                          <>
+                            <Facebook className="h-5 w-5 mr-2" />
+                            Connect Manually
+                          </>
+                        )}
+                      </button>
+                    </div>
                     
                     {fbDebugInfo.length > 0 && (
                       <div className="mt-4 p-3 bg-gray-50 rounded-md">
