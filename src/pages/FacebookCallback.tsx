@@ -65,56 +65,60 @@ export default function FacebookCallback() {
       }
       
       // First check if we're already authenticated
-      const { data: { session } } = await supabase.auth.getSession();
-      
-      if (session) {
-        addDebugInfo(`Already authenticated as ${session.user.email || session.user.id}`);
-        setAuthRestoreAttempted(true);
-        return;
-      }
-
       try {
-        const restored = await restoreFacebookAuthState();
+        const { data: { session }, error } = await supabase.auth.getSession();
         
-        if (restored) {
-          addDebugInfo('Authentication state restored successfully');
+        if (error) {
+          addDebugInfo(`Error checking session: ${error.message}`);
+          throw error;
+        }
+        
+        if (session) {
+          addDebugInfo(`Already authenticated as ${session.user.email || session.user.id}`);
           setAuthRestoreAttempted(true);
-        } else {
-          addDebugInfo('Could not restore authentication state, will attempt to continue anyway');
+          return;
+        }
+
+        addDebugInfo('No active session found, attempting to restore');
+        
+        try {
+          const restored = await restoreFacebookAuthState();
           
-          // We might need to redirect back to auth
-          if (!session) {
-            addDebugInfo('No active session, redirecting to auth page in 5 seconds...');
+          if (restored) {
+            addDebugInfo('Authentication state restored successfully');
+            setAuthRestoreAttempted(true);
+          } else {
+            addDebugInfo('Could not restore authentication state, will attempt to continue anyway');
+            
+            // We might need to redirect back to auth
+            // We'll do this after processing the token exchange
+            setAuthRestoreAttempted(true);
+          }
+        } catch (restoreError) {
+          addDebugInfo(`Error restoring auth state: ${restoreError instanceof Error ? restoreError.message : 'Unknown error'}`);
+          
+          // If we've reached max attempts, redirect to auth
+          if (restoreAttemptCount >= maxAttempts) {
+            addDebugInfo(`Max restore attempts (${maxAttempts}) reached, redirecting to auth`);
             setTimeout(() => {
               navigate('/auth', { 
                 state: { 
-                  message: 'Session expired. Please log in again to complete Facebook connection.',
+                  message: 'Failed to restore session. Please log in again to complete Facebook connection.',
                   fromOAuth: true 
                 } 
               });
-            }, 5000);
+            }, 3000);
+          } else {
+            // Try again after a delay
+            setTimeout(() => {
+              setAuthRestoreAttempted(false);  // Reset flag to retry
+            }, 1500);
           }
         }
-      } catch (restoreError) {
-        addDebugInfo(`Error restoring auth state: ${restoreError instanceof Error ? restoreError.message : 'Unknown error'}`);
-        
-        // If we've reached max attempts, redirect to auth
-        if (restoreAttemptCount >= maxAttempts) {
-          addDebugInfo(`Max restore attempts (${maxAttempts}) reached, redirecting to auth`);
-          setTimeout(() => {
-            navigate('/auth', { 
-              state: { 
-                message: 'Failed to restore session. Please log in again to complete Facebook connection.',
-                fromOAuth: true 
-              } 
-            });
-          }, 3000);
-        } else {
-          // Try again after a delay
-          setTimeout(() => {
-            setAuthRestoreAttempted(false);  // Reset flag to retry
-          }, 1500);
-        }
+      } catch (sessionError) {
+        addDebugInfo(`Session check error: ${sessionError instanceof Error ? sessionError.message : 'Unknown error'}`);
+        // If there's an error checking the session, try to continue anyway
+        setAuthRestoreAttempted(true);
       }
     };
     
