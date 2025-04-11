@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { handleFacebookStatusChange } from '../lib/facebookAuth';
+import { waitForFacebookSDK, parseXFBML, isFacebookSDKReady, loginWithFacebook } from '../lib/facebookSdk';
 import { AlertTriangle } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 
@@ -35,15 +36,32 @@ const FacebookLoginButton: React.FC<FacebookLoginButtonProps> = ({
 
   // Define the global callback function that the FB button will call
   useEffect(() => {
-    window.checkLoginState = function() {
-      if (typeof window.FB !== 'undefined') {
-        window.FB.getLoginStatus(function(response: any) {
-          statusChangeCallback(response);
-        });
-      } else {
-        console.error("Facebook SDK not initialized");
-        setSdkError("Facebook SDK failed to initialize. Please refresh the page and try again.");
-        if (onLoginFailure) onLoginFailure("Facebook SDK not initialized");
+    window.checkLoginState = async function() {
+      try {
+        // Only proceed if SDK is ready
+        if (isFacebookSDKReady()) {
+          window.FB.getLoginStatus(function(response: any) {
+            statusChangeCallback(response);
+          });
+        } else {
+          console.log("Facebook SDK not fully initialized, waiting...");
+          // Wait for SDK to initialize before checking login status
+          waitForFacebookSDK(5000)
+            .then(() => {
+              window.FB.getLoginStatus(function(response: any) {
+                statusChangeCallback(response);
+              });
+            })
+            .catch(error => {
+              console.error("Facebook SDK initialization timed out:", error);
+              setSdkError("Facebook SDK failed to initialize. Please refresh the page and try again.");
+              if (onLoginFailure) onLoginFailure("Facebook SDK not initialized");
+            });
+        }
+      } catch (error) {
+        console.error("Error in checkLoginState:", error);
+        setSdkError("Error checking login state. Please try again.");
+        if (onLoginFailure) onLoginFailure("Error checking login state");
       }
     };
 
@@ -67,65 +85,106 @@ const FacebookLoginButton: React.FC<FacebookLoginButtonProps> = ({
       }
     };
 
-    // Check periodically if the Facebook SDK is loaded
-    const checkFBInterval = setInterval(() => {
-      if (typeof window.FB !== 'undefined' && buttonRef.current) {
-        console.log("Facebook SDK loaded, parsing XFBML");
-        setSdkLoaded(true);
-        try {
-          // Remove any existing button first to prevent duplication
-          const existingButtons = buttonRef.current.querySelectorAll('.fb-login-button');
-          existingButtons.forEach(button => {
-            if (button.id !== buttonId) {
-              button.remove();
-            }
-          });
-          
-          // Then parse the XFBML
-          window.FB.XFBML.parse(buttonRef.current);
-          setButtonRendered(true);
-          clearInterval(checkFBInterval); // Clear interval once loaded
-        } catch (e) {
-          console.error("Error parsing XFBML:", e);
-          setSdkError('Failed to initialize Facebook login. Please refresh the page.');
-        }
-      } else {
-        // Increment the check attempt counter
-        setSdkCheckAttempts(prev => prev + 1);
-        
-        // If we've checked too many times, show error
-        if (sdkCheckAttempts >= 20) {
-          clearInterval(checkFBInterval);
-          setSdkError('Facebook SDK failed to load. Please check your internet connection and try again.');
-        }
-      }
-    }, 500);
-    
-    // Cleanup interval after 20 seconds to prevent memory leaks
-    setTimeout(() => {
-      clearInterval(checkFBInterval);
-    }, 20000);
-
-    // Cleanup function
     return () => {
-      clearInterval(checkFBInterval);
       // Keep the global checkLoginState function as other buttons might need it
     };
-  }, [scope, onLoginSuccess, onLoginFailure, buttonId, sdkLoaded, sdkCheckAttempts]);
+  }, [scope, onLoginSuccess, onLoginFailure]);
+
+  // Initialize and ensure Facebook SDK is ready
+  useEffect(() => {
+    let checkTimeoutId: NodeJS.Timeout;
+    let maxCheckTime = false;
+    
+    const initializeButton = async () => {
+      try {
+        // Wait for SDK to be ready
+        await waitForFacebookSDK(8000);
+        setSdkLoaded(true);
+        
+        // Make sure button ref is available
+        if (!buttonRef.current) {
+          console.warn("Button ref not available yet");
+          return;
+        }
+        
+        // Remove any existing buttons to prevent duplication
+        const existingButtons = buttonRef.current.querySelectorAll('.fb-login-button');
+        existingButtons.forEach(button => {
+          if (button.id !== buttonId) {
+            button.remove();
+          }
+        });
+        
+        // Parse XFBML in the button container
+        await parseXFBML(buttonRef.current);
+        setButtonRendered(true);
+        setSdkError('');
+        console.log("Facebook button rendered successfully");
+      } catch (error) {
+        console.error("Error initializing Facebook button:", error);
+        setSdkError("Failed to initialize Facebook login. Please refresh the page or try another method.");
+      }
+    };
+    
+    // Check periodically if the SDK is loaded and render button when ready
+    const checkAndRenderButton = () => {
+      if (isFacebookSDKReady() && buttonRef.current) {
+        setSdkLoaded(true);
+        parseXFBML(buttonRef.current)
+          .then(() => {
+            setButtonRendered(true);
+            setSdkError('');
+          })
+          .catch(error => {
+            console.error("Error parsing XFBML:", error);
+            setSdkError("Failed to render Facebook button. Please try again.");
+          });
+        return true;
+      }
+      return false;
+    };
+    
+    // Initial attempt
+    if (!checkAndRenderButton()) {
+      // Set up periodic checks
+      const checkInterval = setInterval(() => {
+        if (maxCheckTime || checkAndRenderButton()) {
+          clearInterval(checkInterval);
+        } else {
+          setSdkCheckAttempts(prev => prev + 1);
+        }
+      }, 1000);
+      
+      // Set a maximum time to wait
+      checkTimeoutId = setTimeout(() => {
+        clearInterval(checkInterval);
+        maxCheckTime = true;
+        if (!sdkLoaded) {
+          setSdkError("Facebook SDK took too long to load. Please refresh the page or try direct login.");
+        }
+      }, 15000);
+    }
+    
+    return () => {
+      clearTimeout(checkTimeoutId);
+    };
+  }, [buttonId]);
 
   // Force manual initialization if FB SDK is available but not loaded properly
   const handleManualInitialization = () => {
+    setSdkError('');
+    
     if (typeof window.FB !== 'undefined' && buttonRef.current) {
       try {
         window.FB.XFBML.parse(buttonRef.current);
-        setSdkError('');
         setSdkLoaded(true);
         setButtonRendered(true);
       } catch (e) {
         console.error("Error in manual initialization:", e);
+        setSdkError("Failed to initialize Facebook button manually. Please try direct login.");
       }
     } else {
-      // If the SDK is not available, try reloading the script
+      // If the SDK is not available, try to reload the script
       const fbScript = document.getElementById('facebook-jssdk');
       if (fbScript) {
         fbScript.remove();
@@ -146,7 +205,7 @@ const FacebookLoginButton: React.FC<FacebookLoginButtonProps> = ({
         // Initialize the SDK
         if (typeof window.FB !== 'undefined') {
           window.FB.init({
-            appId: import.meta.env.VITE_META_APP_ID,
+            appId: window.ENV?.META_APP_ID,
             cookie: true,
             xfbml: true,
             version: 'v18.0'
@@ -162,14 +221,14 @@ const FacebookLoginButton: React.FC<FacebookLoginButtonProps> = ({
       };
       
       script.onerror = () => {
-        setSdkError('Failed to load Facebook SDK. Please check your internet connection.');
+        setSdkError('Failed to load Facebook SDK. Please try direct login.');
       };
     }
   };
 
   // Fallback to direct URL if button doesn't load
   const handleDirectLogin = () => {
-    const appId = import.meta.env.VITE_META_APP_ID;
+    const appId = window.ENV?.META_APP_ID;
     if (!appId) {
       setSdkError('Facebook App ID is missing. Please check your configuration.');
       return;
@@ -195,6 +254,26 @@ const FacebookLoginButton: React.FC<FacebookLoginButtonProps> = ({
       console.error('Error getting session:', error);
       setSdkError(`Failed to prepare for Facebook login: ${error.message}`);
     });
+  };
+
+  // Handle login with SDK directly
+  const handleSdkLogin = async () => {
+    try {
+      const response = await loginWithFacebook(scope);
+      if (response.status === 'connected') {
+        console.log("Login successful through SDK");
+        const success = await handleFacebookStatusChange(response);
+        if (success && onLoginSuccess) {
+          onLoginSuccess();
+        }
+      } else {
+        console.log("Login unsuccessful:", response);
+        if (onLoginFailure) onLoginFailure('Login was not successful');
+      }
+    } catch (error) {
+      console.error("SDK login error:", error);
+      setSdkError("Error during Facebook login. Please try direct login instead.");
+    }
   };
 
   return (
@@ -231,10 +310,16 @@ const FacebookLoginButton: React.FC<FacebookLoginButtonProps> = ({
                   Retry Loading
                 </button>
                 <button 
-                  onClick={handleDirectLogin}
+                  onClick={handleSdkLogin}
                   className="text-xs px-2 py-1 bg-blue-100 text-blue-700 rounded hover:bg-blue-200"
                 >
-                  Login Directly
+                  Try SDK Login
+                </button>
+                <button 
+                  onClick={handleDirectLogin}
+                  className="text-xs px-2 py-1 bg-green-100 text-green-700 rounded hover:bg-green-200"
+                >
+                  Direct Login
                 </button>
               </div>
             </div>
