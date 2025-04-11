@@ -17,6 +17,7 @@ export default function Auth({ initialError = null }: AuthProps) {
   const [authResult, setAuthResult] = useState<any>(null);
   const [sessionCleared, setSessionCleared] = useState(false);
   const [isRestoringFacebookAuth, setIsRestoringFacebookAuth] = useState(false);
+  const [forcedClearAttempted, setForcedClearAttempted] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -29,73 +30,79 @@ export default function Auth({ initialError = null }: AuthProps) {
     });
   };
 
-  // Check if we're returning from a Facebook OAuth flow
+  // Handle OAuth return detection
   useEffect(() => {
-    const checkForFacebookRedirect = () => {
-      const isFromFacebook = 
-        location.pathname.includes('/auth') && 
-        localStorage.getItem('fb_auth_state') !== null;
-
-      if (isFromFacebook) {
+    const checkForOAuthReturnAndAuthState = () => {
+      // Check if we're returning from OAuth
+      const isFromOAuth = location.state?.fromOAuth || 
+        localStorage.getItem('fb_auth_state') !== null ||
+        location.pathname.includes('/oauth/');
+      
+      if (isFromOAuth) {
         setIsRestoringFacebookAuth(true);
-        addDebugInfo('Detected return from Facebook OAuth flow');
+        addDebugInfo('Detected return from OAuth flow');
         
+        // Do not redirect back to callback, as we're already at auth
+        // Just handle the messages and state appropriately
+        if (location.state?.message) {
+          addDebugInfo(`OAuth message: ${location.state.message}`);
+          setError(location.state.message);
+        }
+        
+        // Check for any saved auth state
         try {
-          // Parse the saved auth state
-          const savedState = JSON.parse(localStorage.getItem('fb_auth_state') || '{}');
-          
-          if (savedState && savedState.timestamp) {
-            const ageInMinutes = (Date.now() - savedState.timestamp) / (60 * 1000);
-            addDebugInfo(`Facebook auth state is ${ageInMinutes.toFixed(1)} minutes old`);
-            
-            // If it's recent (less than 15 minutes old), we'll preserve it
-            if (ageInMinutes < 15) {
-              addDebugInfo('Facebook auth state is recent, will preserve it');
+          const fbState = localStorage.getItem('fb_auth_state');
+          if (fbState) {
+            const savedState = JSON.parse(fbState);
+            if (savedState && savedState.timestamp) {
+              const ageInMinutes = (Date.now() - savedState.timestamp) / (60 * 1000);
+              addDebugInfo(`OAuth auth state is ${ageInMinutes.toFixed(1)} minutes old`);
               
-              // Redirect to callback page to complete the process
-              navigate('/oauth/facebook/callback' + window.location.search, { replace: true });
-              return;
-            } else {
-              // Clear stale state to prevent future loops
-              localStorage.removeItem('fb_auth_state');
-              addDebugInfo('Cleared stale Facebook auth state');
+              if (ageInMinutes > 15) {
+                // State is too old, remove it
+                localStorage.removeItem('fb_auth_state');
+                addDebugInfo('Removed stale OAuth auth state');
+              }
             }
           }
         } catch (e) {
-          addDebugInfo(`Error parsing Facebook auth state: ${e instanceof Error ? e.message : 'Unknown error'}`);
-          // Clear invalid state to prevent future loops
+          addDebugInfo(`Error processing OAuth state: ${e instanceof Error ? e.message : 'Unknown'}`);
           localStorage.removeItem('fb_auth_state');
         }
       }
     };
     
-    checkForFacebookRedirect();
+    checkForOAuthReturnAndAuthState();
   }, [location, navigate]);
 
-  // Perform a single cleanup of any existing session when this component mounts,
-  // but only if we're not in the process of restoring a Facebook auth
+  // Force clear session on mount unless we're restoring OAuth
   useEffect(() => {
     const cleanupSession = async () => {
-      // Skip session cleanup if we're restoring Facebook auth
-      if (isRestoringFacebookAuth) {
-        addDebugInfo('Skipping session cleanup because we are restoring Facebook auth');
+      // Skip session cleanup if we're restoring OAuth auth or already attempted
+      if (isRestoringFacebookAuth || forcedClearAttempted) {
+        if (isRestoringFacebookAuth) {
+          addDebugInfo('Skipping session cleanup because we are restoring OAuth auth');
+        } else {
+          addDebugInfo('Skipping session cleanup because we already attempted it');
+        }
         setSessionCleared(true);
         return;
       }
 
       try {
-        addDebugInfo("Performing sign out to ensure a clean session state");
+        addDebugInfo("Performing forced sign out to clear any stale sessions");
         await clearSupabaseAuth();
-        addDebugInfo("Sign out completed");
+        addDebugInfo("Forced sign out completed");
+        setForcedClearAttempted(true);
       } catch (err) {
-        addDebugInfo(`Error during sign out: ${err instanceof Error ? err.message : 'Unknown'}`);
+        addDebugInfo(`Error during forced sign out: ${err instanceof Error ? err.message : 'Unknown'}`);
       } finally {
         setSessionCleared(true);
       }
     };
     
     cleanupSession();
-  }, [isRestoringFacebookAuth]);
+  }, [isRestoringFacebookAuth, forcedClearAttempted]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -104,6 +111,11 @@ export default function Auth({ initialError = null }: AuthProps) {
     addDebugInfo(`Attempting ${isSignUp ? 'signup' : 'login'} with email: ${email}`);
 
     try {
+      // First clear any existing sessions again to be 100% sure
+      if (!isRestoringFacebookAuth) {
+        await clearSupabaseAuth();
+      }
+      
       let result;
       
       if (isSignUp) {
@@ -147,6 +159,11 @@ export default function Auth({ initialError = null }: AuthProps) {
           
           addDebugInfo(`Session expires in ${expiresInMinutes} minutes (at ${expiresAt.toLocaleTimeString()})`);
           addDebugInfo(`Has refresh token: ${!!result.data.session.refresh_token}`);
+          
+          // Navigate to dashboard on successful login
+          setTimeout(() => {
+            navigate('/dashboard');
+          }, 500);
         }
       }
     } catch (error) {
@@ -165,20 +182,20 @@ export default function Auth({ initialError = null }: AuthProps) {
         <div className="sm:mx-auto sm:w-full sm:max-w-md text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto mb-4"></div>
           <h2 className="text-xl font-medium text-gray-900">Preparing Authentication</h2>
-          <p className="mt-2 text-sm text-gray-500">Setting up secure session...</p>
+          <p className="mt-2 text-sm text-gray-500">Clearing any existing sessions...</p>
         </div>
       </div>
     );
   }
 
   // If we're restoring Facebook auth, show a different loading indicator
-  if (isRestoringFacebookAuth) {
+  if (isRestoringFacebookAuth && debugInfo.length < 5) {
     return (
       <div className="min-h-screen bg-gray-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8">
         <div className="sm:mx-auto sm:w-full sm:max-w-md text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto mb-4"></div>
-          <h2 className="text-xl font-medium text-gray-900">Completing Facebook Login</h2>
-          <p className="mt-2 text-sm text-gray-500">Please wait while we restore your session...</p>
+          <h2 className="text-xl font-medium text-gray-900">Handling OAuth Return</h2>
+          <p className="mt-2 text-sm text-gray-500">Please wait while we complete the authentication process...</p>
         </div>
       </div>
     );
@@ -271,48 +288,21 @@ export default function Auth({ initialError = null }: AuthProps) {
             </div>
           </div>
           
-          {/* Environment information for debugging */}
-          <div className="mt-6 p-3 bg-gray-50 rounded-md">
-            <div className="flex justify-between items-center">
-              <p className="text-xs text-gray-500 font-semibold">Environment:</p>
-              <button 
-                onClick={() => navigator.clipboard.writeText(JSON.stringify({
-                  url: window.ENV?.SUPABASE_URL || 'Not set',
-                  key: window.ENV?.SUPABASE_ANON_KEY ? 'Set' : 'Not set',
-                  app: window.ENV?.APP_URL || 'Not set',
-                  mode: import.meta.env.MODE || 'unknown',
-                }, null, 2))}
-                className="text-xs text-indigo-600 hover:underline"
-              >
-                Copy Info
-              </button>
-            </div>
-            <div className="text-xs text-gray-500 mt-1">
-              <div className="flex justify-between">
-                <span>Supabase URL:</span>
-                <span>{import.meta.env.VITE_SUPABASE_URL ? '✅ Set' : '❌ Not set'}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Supabase Key:</span>
-                <span>{import.meta.env.VITE_SUPABASE_ANON_KEY ? '✅ Set' : '❌ Not set'}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Meta App ID:</span>
-                <span>{window.ENV?.META_APP_ID ? '✅ Set' : '❌ Not set'}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Environment:</span>
-                <span>{import.meta.env.MODE || 'unknown'}</span>
-              </div>
-            </div>
-          </div>
-          
+          {/* Debug information */}
           {debugInfo.length > 0 && (
             <div className="mt-6 p-3 bg-gray-50 rounded-md">
-              <p className="text-xs text-gray-500 font-semibold mb-1">Debug Information:</p>
-              <div className="text-xs text-gray-500 max-h-40 overflow-y-auto">
+              <div className="flex justify-between items-center">
+                <p className="text-xs text-gray-500 font-semibold">Debug Information:</p>
+                <button 
+                  onClick={() => navigator.clipboard.writeText(JSON.stringify(debugInfo, null, 2))}
+                  className="text-xs text-indigo-600 hover:underline"
+                >
+                  Copy
+                </button>
+              </div>
+              <div className="text-xs text-gray-500 mt-1 space-y-1">
                 {debugInfo.map((info, idx) => (
-                  <div key={idx}>{info}</div>
+                  <div key={idx} className="bg-white p-1 rounded">{info}</div>
                 ))}
               </div>
             </div>
