@@ -37,7 +37,7 @@
     <!-- Facebook SDK root element -->
     <div id="fb-root"></div>
     
-    <!-- Facebook SDK -->
+    <!-- Facebook SDK initialization -->
     <script>
       window.fbAsyncInit = function() {
         FB.init({
@@ -49,10 +49,19 @@
           
         FB.AppEvents.logPageView();
         
+        // Add a flag to indicate Facebook SDK has been loaded
+        window.fbSDKLoaded = true;
+        
+        // Dispatch a custom event for components to listen for
+        window.dispatchEvent(new Event('fbSDKLoaded'));
+        
         // Check if checkLoginState function is defined
         if (typeof window.checkLoginState === 'function') {
-          // If we have the function, check login status
-          window.checkLoginState();
+          // Wait for a short time before checking login status to ensure
+          // the SDK is fully initialized
+          setTimeout(() => {
+            window.checkLoginState();
+          }, 100);
         }
       };
 
