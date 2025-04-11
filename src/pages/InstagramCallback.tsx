@@ -2,12 +2,14 @@ import React, { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import { MessageSquare, AlertCircle, Instagram } from 'lucide-react';
+import { restoreFacebookAuthState } from '../lib/facebookAuth';
 
 export default function InstagramCallback() {
   const [error, setError] = useState<string | null>(null);
   const [processing, setProcessing] = useState(true);
-  const [status, setStatus] = useState<'processing' | 'exchanging_code' | 'saving' | 'success' | 'error'>('processing');
+  const [status, setStatus] = useState<'processing' | 'auth_restore' | 'exchanging_code' | 'getting_accounts' | 'saving' | 'success' | 'error'>('processing');
   const [debugInfo, setDebugInfo] = useState<string[]>([]);
+  const [authRestoreAttempted, setAuthRestoreAttempted] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -16,7 +18,78 @@ export default function InstagramCallback() {
     setDebugInfo(prev => [...prev, `${new Date().toISOString().slice(11, 19)}: ${message}`]);
   };
 
+  // First, attempt to restore authentication state
   useEffect(() => {
+    const restoreAuth = async () => {
+      if (authRestoreAttempted) return;
+      
+      addDebugInfo('Attempting to restore authentication state');
+      setStatus('auth_restore');
+      
+      // Check if we have saved auth state
+      const savedState = localStorage.getItem('fb_auth_state');
+      if (savedState) {
+        try {
+          const parsedState = JSON.parse(savedState);
+          addDebugInfo(`Found saved auth state for user ${parsedState.userId?.slice(0, 8) || 'unknown'}...`);
+          
+          // Check if state is recent enough
+          const stateAgeMinutes = (Date.now() - parsedState.timestamp) / (60 * 1000);
+          if (stateAgeMinutes > 15) {
+            localStorage.removeItem('fb_auth_state');
+            addDebugInfo('Auth state too old, removed it');
+          }
+        } catch (e) {
+          localStorage.removeItem('fb_auth_state');
+          addDebugInfo(`Error parsing auth state: ${e instanceof Error ? e.message : 'Unknown error'}`);
+        }
+      }
+      
+      // Check if we're already authenticated
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      if (session) {
+        addDebugInfo(`Already authenticated as ${session.user.email || session.user.id}`);
+        setAuthRestoreAttempted(true);
+        return;
+      }
+      
+      try {
+        const restored = await restoreFacebookAuthState();
+        
+        if (restored) {
+          addDebugInfo('Authentication state restored successfully');
+        } else {
+          addDebugInfo('Could not restore auth state, will attempt to continue anyway');
+          
+          // We might need to redirect back to auth
+          if (!session) {
+            addDebugInfo('No active session, redirecting to auth page in 5 seconds...');
+            setTimeout(() => {
+              navigate('/auth', { 
+                state: { 
+                  message: 'Session expired. Please log in again to complete Instagram connection.',
+                  fromOAuth: true 
+                } 
+              });
+            }, 5000);
+          }
+        }
+      } catch (error) {
+        addDebugInfo(`Error restoring auth state: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      } finally {
+        setAuthRestoreAttempted(true);
+      }
+    };
+    
+    restoreAuth();
+  }, [navigate, authRestoreAttempted]);
+
+  // Process the Instagram callback once auth restore is attempted
+  useEffect(() => {
+    // If we're still trying to restore auth, skip processing the callback
+    if (!authRestoreAttempted) return;
+    
     async function handleInstagramCallback() {
       try {
         // Extract code from URL
@@ -44,35 +117,109 @@ export default function InstagramCallback() {
 
         addDebugInfo(`Authenticated as user ID: ${userData.user.id}`);
 
-        // In a real app, you would exchange the code for a token server-side
-        // For this implementation, we'll proceed with a simulated token exchange
-        
+        // Exchange code for token using our Netlify function
         setStatus('exchanging_code');
-        addDebugInfo('Simulating Instagram token exchange...');
+        addDebugInfo('Exchanging authorization code for access token...');
         
-        // Simulate API delay
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        const exchangeResponse = await fetch(`/.netlify/functions/exchangeToken?code=${code}`);
         
-        // Generate a realistic Instagram business account ID and token
-        const mockIgAccountId = `17841458279797289`; // Use a consistent ID for testing
-        const mockToken = `IGQWRQFBnc3h1cG9ueGxXZAWRoN0Q0d01QZAUZA...${Date.now().toString(36)}`; // Long-lived token format
+        if (!exchangeResponse.ok) {
+          const errorData = await exchangeResponse.json();
+          throw new Error(`Token exchange failed: ${errorData.error || 'Unknown error'}`);
+        }
         
-        // Calculate token expiry - 60 days from now
-        const expiryDate = new Date();
-        expiryDate.setDate(expiryDate.getDate() + 60);
+        const tokenData = await exchangeResponse.json();
         
-        addDebugInfo(`Generated mock Instagram account ID: ${mockIgAccountId}`);
+        if (!tokenData.accessToken) {
+          throw new Error('No access token returned from server');
+        }
         
-        // Save to database
+        addDebugInfo('Successfully received access token');
+        
+        // Now get the Instagram business account connected to the user's Facebook page
+        setStatus('getting_accounts');
+        addDebugInfo('Getting Facebook pages and Instagram accounts...');
+        
+        const pages = tokenData.pages || [];
+        
+        if (pages.length === 0) {
+          addDebugInfo('No Facebook pages found. Attempting to fetch pages directly...');
+          
+          try {
+            const pagesResponse = await fetch(`/.netlify/functions/getPageToken?token=${tokenData.accessToken}&pageId=me/accounts`);
+            
+            if (!pagesResponse.ok) {
+              const pageError = await pagesResponse.json();
+              addDebugInfo(`Error fetching pages: ${pageError.error || 'Unknown error'}`);
+            } else {
+              const pagesData = await pagesResponse.json();
+              if (pagesData.pages && pagesData.pages.length > 0) {
+                addDebugInfo(`Found ${pagesData.pages.length} Facebook pages`);
+                pages.push(...pagesData.pages);
+              }
+            }
+          } catch (pageError) {
+            addDebugInfo(`Exception fetching pages: ${pageError instanceof Error ? pageError.message : 'Unknown error'}`);
+          }
+        }
+        
+        if (pages.length === 0) {
+          throw new Error('No Facebook pages available. Please create a Facebook page first.');
+        }
+        
+        // For each page, check if it has an Instagram business account
+        let instagramAccount = null;
+        
+        for (const page of pages) {
+          try {
+            addDebugInfo(`Checking Instagram accounts for page: ${page.name || page.id}`);
+            
+            const igResponse = await fetch(`/.netlify/functions/getInstagramAccounts?token=${tokenData.accessToken}&pageId=${page.id}`);
+            
+            if (igResponse.ok) {
+              const igData = await igResponse.json();
+              
+              if (igData.instagramAccount) {
+                addDebugInfo(`Found Instagram business account: ${igData.instagramAccount.username || igData.instagramAccount.id}`);
+                instagramAccount = igData.instagramAccount;
+                break;
+              }
+            }
+          } catch (igError) {
+            addDebugInfo(`Error checking Instagram for page ${page.id}: ${igError instanceof Error ? igError.message : 'Unknown error'}`);
+            // Continue to next page
+          }
+        }
+        
+        if (!instagramAccount) {
+          throw new Error('No Instagram business accounts found. Please connect an Instagram business account to one of your Facebook pages.');
+        }
+        
+        // Get long-lived token for the page that owns the Instagram account
+        addDebugInfo('Getting long-lived token...');
+        const longLivedTokenResponse = await fetch(`/.netlify/functions/getLongLivedToken?token=${tokenData.accessToken}`);
+        
+        if (!longLivedTokenResponse.ok) {
+          const tokenError = await longLivedTokenResponse.json();
+          throw new Error(`Failed to get long-lived token: ${tokenError.error || 'Unknown error'}`);
+        }
+        
+        const longLivedTokenData = await longLivedTokenResponse.json();
+        
+        // Calculate token expiry date - use 60 days if not specified
+        const expiryDate = longLivedTokenData.expiryDate || 
+                          new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
+        
+        // Save connection to database
         setStatus('saving');
         addDebugInfo('Saving Instagram connection to database...');
         
-        // Check for an existing connection
+        // Check for existing connection
         const { data: existingConnections, error: connectionError } = await supabase
           .from('social_connections')
           .select('*')
           .eq('user_id', userData.user.id)
-          .eq('ig_account_id', mockIgAccountId);
+          .eq('ig_account_id', instagramAccount.id);
           
         if (connectionError) {
           addDebugInfo(`Error checking existing connections: ${connectionError.message}`);
@@ -85,8 +232,8 @@ export default function InstagramCallback() {
           const { error: updateError } = await supabase
             .from('social_connections')
             .update({
-              access_token: mockToken,
-              token_expiry: expiryDate.toISOString(),
+              access_token: longLivedTokenData.accessToken,
+              token_expiry: expiryDate,
               refreshed_at: new Date().toISOString()
             })
             .eq('id', existingConnections[0].id);
@@ -102,9 +249,9 @@ export default function InstagramCallback() {
             .from('social_connections')
             .insert({
               user_id: userData.user.id,
-              ig_account_id: mockIgAccountId,
-              access_token: mockToken,
-              token_expiry: expiryDate.toISOString()
+              ig_account_id: instagramAccount.id,
+              access_token: longLivedTokenData.accessToken,
+              token_expiry: expiryDate
             });
             
           if (insertError) {
@@ -112,6 +259,9 @@ export default function InstagramCallback() {
             throw insertError;
           }
         }
+        
+        // Clean up storage
+        localStorage.removeItem('fb_auth_state');
         
         addDebugInfo('Instagram connection saved successfully');
         setStatus('success');
@@ -131,7 +281,7 @@ export default function InstagramCallback() {
     }
 
     handleInstagramCallback();
-  }, [location, navigate]);
+  }, [location, navigate, authRestoreAttempted]);
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8">
@@ -146,14 +296,16 @@ export default function InstagramCallback() {
 
       <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-md">
         <div className="bg-white py-8 px-4 shadow sm:rounded-lg sm:px-10 text-center">
-          {status === 'processing' || status === 'exchanging_code' || status === 'saving' ? (
+          {status === 'processing' || status === 'auth_restore' || status === 'exchanging_code' || status === 'getting_accounts' || status === 'saving' ? (
             <>
               <div className="flex justify-center mb-4">
                 <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
               </div>
               <p className="text-gray-700">
                 {status === 'processing' && 'Processing your Instagram connection...'}
+                {status === 'auth_restore' && 'Restoring your authentication session...'}
                 {status === 'exchanging_code' && 'Exchanging authorization code for access token...'}
+                {status === 'getting_accounts' && 'Retrieving your Instagram business accounts...'}
                 {status === 'saving' && 'Saving your Instagram account connection...'}
               </p>
               <p className="text-sm text-gray-500 mt-2">
@@ -196,6 +348,18 @@ export default function InstagramCallback() {
                   <div key={idx}>{info}</div>
                 ))}
               </div>
+            </div>
+          )}
+
+          {/* Manual navigation option if stuck */}
+          {(status === 'auth_restore' || status === 'processing') && debugInfo.length > 5 && (
+            <div className="mt-4">
+              <button
+                onClick={() => navigate('/auth')}
+                className="px-3 py-1 text-sm text-indigo-600 hover:text-indigo-500 border border-indigo-200 rounded"
+              >
+                Taking too long? Go to login page
+              </button>
             </div>
           )}
         </div>
