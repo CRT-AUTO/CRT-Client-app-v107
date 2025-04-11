@@ -27,9 +27,6 @@ function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [connectionRetries, setConnectionRetries] = useState(0);
   const [debugInfo, setDebugInfo] = useState<string[]>([]);
-  const [forceReset, setForceReset] = useState(false);
-  const [signOutInProgress, setSignOutInProgress] = useState(false);
-  const [initAttempted, setInitAttempted] = useState(false);
   const [forcedClearCompleted, setForcedClearCompleted] = useState(false);
   
   // Reference to store timeout ID for session refresh
@@ -55,27 +52,23 @@ function App() {
       }
       
       // Only attempt once and if not already completed
-      if (signOutInProgress || initAttempted || forcedClearCompleted) {
+      if (forcedClearCompleted) {
         return;
       }
       
       try {
-        setSignOutInProgress(true);
-        setInitAttempted(true);
         addDebugInfo("Performing forced sign out to clear any stale sessions");
         await clearSupabaseAuth();
         addDebugInfo("Forced sign out completed");
-        setForcedClearCompleted(true);
       } catch (err) {
         addDebugInfo(`Error during forced sign out: ${err instanceof Error ? err.message : 'Unknown'}`);
-        setForcedClearCompleted(true); // Mark as completed even on error to avoid retries
       } finally {
-        setSignOutInProgress(false);
+        setForcedClearCompleted(true);
       }
     };
     
     forceClearAuth();
-  }, [forceReset]);
+  }, []);
 
   // Setup session refresh mechanism
   const setupSessionRefresh = useCallback((expiresAt: number) => {
@@ -122,11 +115,7 @@ function App() {
 
   useEffect(() => {
     // Only initialize auth after forced sign-out completes
-    // or if we're returning from a Facebook auth flow
-    if (signOutInProgress) return;
-    
-    // Wait until the forced clear is completed or we're explicitly returning from Facebook
-    if (!forcedClearCompleted && localStorage.getItem('fb_auth_state') === null) return;
+    if (!forcedClearCompleted) return;
     
     async function initializeAuth() {
       try {
@@ -229,9 +218,7 @@ function App() {
     // Add a small delay before initializing auth to ensure Supabase is ready
     // Make the delay shorter if we're returning from Facebook
     const initTimeout = setTimeout(() => {
-      if (!signOutInProgress) {
-        initializeAuth();
-      }
+      initializeAuth();
     }, isFacebookReturn ? 100 : connectionRetries * 300); // Shorter delay for Facebook returns
 
     // Listen for auth state changes
@@ -281,7 +268,7 @@ function App() {
         refreshTimerRef.current = null;
       }
     };
-  }, [connectionRetries, signOutInProgress, setupSessionRefresh, forcedClearCompleted]);
+  }, [connectionRetries, setupSessionRefresh, forcedClearCompleted]);
 
   // Add a timeout detection mechanism
   useEffect(() => {
@@ -335,7 +322,6 @@ function App() {
 
   const handleRetry = () => {
     setConnectionRetries(prev => prev + 1);
-    setForceReset(prev => !prev);
     addDebugInfo(`Retrying connection (attempt ${connectionRetries + 1})`);
   };
 
