@@ -91,6 +91,8 @@ if (!supabaseUrl || !supabaseAnonKey) {
     } else {
       console.log('No initial session found');
     }
+  }).catch(err => {
+    console.error('Exception during initial session check:', err);
   });
   
   // Log successful initialization
@@ -99,6 +101,29 @@ if (!supabaseUrl || !supabaseAnonKey) {
 
 // Export the client (either real or mock)
 export { supabase };
+
+/**
+ * Function with timeout for reliable session checking
+ */
+export async function getSessionWithTimeout(timeoutMs = 10000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    // Set a timeout to prevent hanging
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`Session check timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    
+    // Attempt to get the session
+    supabase.auth.getSession()
+      .then(result => {
+        clearTimeout(timeoutId);
+        resolve(result);
+      })
+      .catch(error => {
+        clearTimeout(timeoutId);
+        reject(error);
+      });
+  });
+}
 
 // Helper function to check if we have working authentication
 export async function checkSupabaseAuth() {
@@ -110,7 +135,7 @@ export async function checkSupabaseAuth() {
       return false;
     }
     
-    const { data: { session }, error } = await supabase.auth.getSession();
+    const { data: { session }, error } = await getSessionWithTimeout(5000);
     
     if (error) {
       console.error('Supabase authentication check failed:', error);
@@ -193,7 +218,7 @@ export async function checkSupabaseDB(): Promise<{success: boolean, error?: stri
     
     // Fallback to session check
     console.log('Falling back to session check...');
-    const { data, error } = await supabase.auth.getSession();
+    const { data, error } = await getSessionWithTimeout(5000);
     
     if (error) {
       console.error('Database connection check failed:', error);
@@ -209,12 +234,12 @@ export async function checkSupabaseDB(): Promise<{success: boolean, error?: stri
   }
 }
 
-// Function to clear any stored sessions
+// Function to clear any stored sessions - improved to be more thorough
 export async function clearSupabaseAuth() {
   try {
     console.log('Attempting to clear Supabase auth session...');
     
-    // Collect keys to remove
+    // Collect all keys to remove
     const keysToRemove: string[] = [];
     
     // Find all Supabase-related localStorage keys
@@ -234,7 +259,7 @@ export async function clearSupabaseAuth() {
       try {
         console.log('Calling supabase.auth.signOut()'); 
         const { error } = await supabase.auth.signOut({ 
-          scope: 'local' // Using 'local' instead of 'global' to only affect this browser
+          scope: 'global' // Use global to clear all sessions, not just the local one
         });
         
         if (error) {
@@ -252,11 +277,22 @@ export async function clearSupabaseAuth() {
       for (const key of keysToRemove) {
         try {
           localStorage.removeItem(key);
+          console.log(`Removed localStorage item: ${key}`);
         } catch (removeError) {
           console.warn(`Error removing localStorage item ${key}:`, removeError);
         }
       }
+    } else {
+      console.log('No Supabase-related localStorage items found to remove');
     }
+    
+    // Extra safety measure - clear any session-related cookies
+    document.cookie.split(';').forEach(cookie => {
+      const [name] = cookie.split('=');
+      if (name.trim().includes('supabase') || name.trim().includes('sb-')) {
+        document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;`;
+      }
+    });
     
     console.log('Successfully cleared auth session');
     return true;
@@ -276,7 +312,7 @@ export async function refreshSupabaseToken(): Promise<boolean> {
     console.log('Attempting to refresh Supabase token...');
     
     // Check if we have a session first
-    const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+    const { data: { session }, error: sessionError } = await getSessionWithTimeout(5000);
     
     if (sessionError) {
       console.error('Error getting session for refresh:', sessionError);
