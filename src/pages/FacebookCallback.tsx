@@ -153,44 +153,54 @@ export default function FacebookCallback() {
 
         addDebugInfo(`Authenticated as user ID: ${userData.user.id}`);
 
-        // Check for pre-stored pages from Facebook login
-        let pages: FacebookPage[] = [];
-        const storedPagesStr = localStorage.getItem('fb_pages');
+        // Exchange code for token using our Netlify function
+        setStatus('exchanging_code');
+        addDebugInfo('Exchanging authorization code for access token...');
         
-        if (storedPagesStr) {
+        const exchangeResponse = await fetch(`/.netlify/functions/exchangeToken?code=${code}`);
+        
+        if (!exchangeResponse.ok) {
+          const errorData = await exchangeResponse.json();
+          throw new Error(`Token exchange failed: ${errorData.error || 'Unknown error'}`);
+        }
+        
+        const tokenData = await exchangeResponse.json();
+        
+        if (!tokenData.accessToken) {
+          throw new Error('No access token returned from server');
+        }
+        
+        addDebugInfo('Successfully received access token');
+        
+        // Get available pages
+        const pages = tokenData.pages || [];
+        
+        if (pages.length === 0) {
+          addDebugInfo('No Facebook pages found in response. Fetching pages separately...');
+          
+          // If no pages were returned, try to get them using the page token function
+          setStatus('getting_pages');
+          
           try {
-            const storedPages = JSON.parse(storedPagesStr);
-            if (Array.isArray(storedPages) && storedPages.length > 0) {
-              pages = storedPages;
-              addDebugInfo(`Found ${pages.length} pages in local storage`);
+            const pageResponse = await fetch(`/.netlify/functions/getPageToken?token=${tokenData.accessToken}&pageId=me/accounts`);
+            
+            if (pageResponse.ok) {
+              const pageData = await pageResponse.json();
+              if (pageData.pages && pageData.pages.length > 0) {
+                pages.push(...pageData.pages);
+                addDebugInfo(`Retrieved ${pageData.pages.length} Facebook pages`);
+              }
             }
-          } catch (e) {
-            addDebugInfo('Error parsing stored pages: ' + String(e));
+          } catch (pageError) {
+            addDebugInfo(`Error fetching pages: ${pageError instanceof Error ? pageError.message : 'Unknown error'}`);
+            // Continue even if page fetching fails
           }
-        }
-        
-        // For demonstration, if no pages were found in storage,
-        // we'll simulate the FB Graph API call to exchange code for token
-        if (pages.length === 0) {
-          addDebugInfo('No stored pages found, simulating token exchange...');
-          setStatus('exchanging_code');
-          
-          // Simulate API delay
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          
-          // Simulating getting a list of pages (in production this would come from the API)
-          pages = [
-            {
-              id: '101234567890123',
-              name: 'Test Business Page',
-              access_token: `EAA${Math.random().toString(36).substring(2, 15)}`,
-              category: 'Business'
-            }
-          ];
+        } else {
+          addDebugInfo(`Found ${pages.length} Facebook pages`);
         }
         
         if (pages.length === 0) {
-          throw new Error('No Facebook pages available for this account');
+          throw new Error('No Facebook pages available for this account. Please create a Facebook page first.');
         }
         
         // If we have exactly one page, use it directly
@@ -210,9 +220,23 @@ export default function FacebookCallback() {
           throw new Error('No Facebook pages available');
         }
         
-        // Calculate token expiry - 60 days from now for long-lived tokens
-        const expiryDate = new Date();
-        expiryDate.setDate(expiryDate.getDate() + 60);
+        // Get long-lived page token
+        addDebugInfo('Getting long-lived page token...');
+        const pageTokenResponse = await fetch(`/.netlify/functions/getPageToken?token=${tokenData.accessToken}&pageId=${selectedPageId}`);
+        
+        if (!pageTokenResponse.ok) {
+          const pageTokenError = await pageTokenResponse.json();
+          throw new Error(`Failed to get page token: ${pageTokenError.error || 'Unknown error'}`);
+        }
+        
+        const pageTokenData = await pageTokenResponse.json();
+        
+        if (!pageTokenData.accessToken) {
+          throw new Error('No page token returned from server');
+        }
+        
+        const pageAccessToken = pageTokenData.accessToken;
+        const expiryDate = pageTokenData.expiryDate || new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString(); // Default 60 days
         
         // Save to database
         setStatus('saving');
@@ -236,8 +260,8 @@ export default function FacebookCallback() {
           const { error: updateError } = await supabase
             .from('social_connections')
             .update({
-              access_token: selectedPage.access_token,
-              token_expiry: expiryDate.toISOString(),
+              access_token: pageAccessToken,
+              token_expiry: expiryDate,
               refreshed_at: new Date().toISOString()
             })
             .eq('id', existingConnections[0].id);
@@ -254,8 +278,8 @@ export default function FacebookCallback() {
             .insert({
               user_id: userData.user.id,
               fb_page_id: selectedPageId,
-              access_token: selectedPage.access_token,
-              token_expiry: expiryDate.toISOString()
+              access_token: pageAccessToken,
+              token_expiry: expiryDate
             });
             
           if (insertError) {
