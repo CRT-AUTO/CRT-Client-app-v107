@@ -125,6 +125,51 @@ export async function getSessionWithTimeout(timeoutMs = 10000): Promise<any> {
   });
 }
 
+/**
+ * Enhanced session check with retry for OAuth flows
+ * This function will retry multiple times with increasing delays
+ * to handle 2FA scenarios in OAuth return
+ */
+export async function getSessionWithRetry(maxTimeMs = 15000, initialDelayMs = 1000): Promise<any> {
+  const startTime = Date.now();
+  let attempt = 1;
+  let lastError: Error | null = null;
+  
+  console.log(`Starting session check with retry (max time: ${maxTimeMs}ms)`);
+  
+  while (Date.now() - startTime < maxTimeMs) {
+    try {
+      const result = await getSessionWithTimeout(5000);
+      if (result?.data?.session) {
+        console.log(`Session found on attempt ${attempt}`);
+        return result;
+      }
+      
+      console.log(`No session on attempt ${attempt}, will retry...`);
+      
+      // Exponential backoff with jitter
+      const delay = Math.min(
+        initialDelayMs * Math.pow(1.5, attempt - 1) * (0.8 + Math.random() * 0.4),
+        3000 // Cap maximum delay at 3 seconds
+      );
+      
+      // Wait before the next attempt
+      await new Promise(resolve => setTimeout(resolve, delay));
+      attempt++;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      console.warn(`Session check attempt ${attempt} failed:`, lastError.message);
+      
+      // Shorter delay on error to try again quickly
+      await new Promise(resolve => setTimeout(resolve, 800));
+      attempt++;
+    }
+  }
+  
+  // If we've exhausted all time, throw the last error or a timeout error
+  throw lastError || new Error(`Session check failed after ${maxTimeMs}ms`);
+}
+
 // Helper function to check if we have working authentication
 export async function checkSupabaseAuth() {
   try {
@@ -166,6 +211,7 @@ export async function checkSupabaseAuth() {
       }
     }
     
+    // Return success
     console.log('Auth check result:', { hasSession: !!session });
     return !!session;
   } catch (error) {
