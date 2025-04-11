@@ -84,53 +84,45 @@ function App() {
   }, []);
 
   useEffect(() => {
-    // Only force sign out on initial load and specifically if returning from Facebook auth
-    const checkFacebookReturn = () => {
-      // Check if we're returning from a Facebook flow
-      const isFacebookReturn = localStorage.getItem('fb_auth_state') !== null;
-      return isFacebookReturn;
-    };
-    
-    // Force a sign out only in specific circumstances
-    const forceClearAuth = async () => {
-      // Skip forced sign out if we're returning from Facebook
-      const isFacebookReturn = checkFacebookReturn();
-      
-      if (isFacebookReturn) {
-        addDebugInfo("Skipping forced sign out due to Facebook auth return");
-        setForcedClearCompleted(true);
-        return;
-      }
-      
-      // Only attempt once 
-      if (signOutInProgress || initAttempted || forcedClearCompleted) {
-        return;
-      }
-      
-      try {
-        setSignOutInProgress(true);
-        setInitAttempted(true);
-        addDebugInfo("Performing forced sign out to clear any stale sessions");
-        await clearSupabaseAuth();
-        addDebugInfo("Forced sign out completed");
-        setForcedClearCompleted(true);
-      } catch (err) {
-        addDebugInfo(`Error during forced sign out: ${err instanceof Error ? err.message : 'Unknown'}`);
-        setForcedClearCompleted(true); // Mark as completed even on error to avoid retries
-      } finally {
-        setSignOutInProgress(false);
-      }
-    };
-    
     // Check for Facebook return before running clearAuth
     // We don't want to clear auth if we're returning from Facebook
     if (window.location.pathname.includes('/oauth/facebook/callback') || 
         window.location.pathname.includes('/oauth/instagram/callback') ||
-        checkFacebookReturn()) {
+        localStorage.getItem('fb_auth_state') !== null) {
       addDebugInfo("Detected OAuth return, skipping forced clear");
       setForcedClearCompleted(true);
     } else {
       // Not an OAuth return, perform the force clear
+      const forceClearAuth = async () => {
+        // Skip forced sign out if we're returning from Facebook
+        const isFacebookReturn = localStorage.getItem('fb_auth_state') !== null;
+        
+        if (isFacebookReturn) {
+          addDebugInfo("Skipping forced sign out due to Facebook auth return");
+          setForcedClearCompleted(true);
+          return;
+        }
+        
+        // Only attempt once 
+        if (signOutInProgress || initAttempted || forcedClearCompleted) {
+          return;
+        }
+        
+        try {
+          setSignOutInProgress(true);
+          setInitAttempted(true);
+          addDebugInfo("Performing forced sign out to clear any stale sessions");
+          await clearSupabaseAuth();
+          addDebugInfo("Forced sign out completed");
+          setForcedClearCompleted(true);
+        } catch (err) {
+          addDebugInfo(`Error during forced sign out: ${err instanceof Error ? err.message : 'Unknown'}`);
+          setForcedClearCompleted(true); // Mark as completed even on error to avoid retries
+        } finally {
+          setSignOutInProgress(false);
+        }
+      };
+      
       forceClearAuth();
     }
   }, [forceReset]);
@@ -416,4 +408,78 @@ function App() {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <div className="text-center max-w-md">
-          <div className="bg-red-50 border b
+          <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 rounded-md mb-4">
+            {error}
+          </div>
+          <button
+            onClick={handleRetry}
+            className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+          >
+            Retry
+          </button>
+          
+          <button
+            onClick={handleForceReset}
+            className="ml-2 inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500"
+          >
+            Reset & Go to Login
+          </button>
+          
+          {/* Debug information */}
+          {debugInfo.length > 0 && (
+            <div className="mt-8 p-4 bg-gray-100 rounded-md">
+              <h3 className="text-sm font-medium text-gray-700 mb-2">Debug Information:</h3>
+              <div className="text-xs text-gray-600 space-y-1">
+                {debugInfo.map((info, idx) => (
+                  <div key={idx} className="bg-white p-1 rounded">{info}</div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <AppErrorBoundary>
+      <ConnectionStatus onRetry={handleRetry} />
+      <BrowserRouter>
+        <Routes>
+          {!user ? (
+            <>
+              <Route path="/auth" element={<Auth />} />
+              <Route path="/deletion-status" element={<DeletionStatus />} />
+              <Route path="*" element={<Navigate to="/auth" replace />} />
+            </>
+          ) : (
+            <>
+              <Route element={<Layout />}>
+                <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/messages" element={<Messages />} />
+                <Route path="/messages/:id" element={<MessageDetail />} />
+                <Route path="/settings" element={<Settings />} />
+              </Route>
+              
+              {user.role === 'admin' && (
+                <Route path="/admin" element={<AdminLayout />}>
+                  <Route index element={<AdminDashboard />} />
+                  <Route path="users" element={<AdminUserManagement />} />
+                  <Route path="users/:userId" element={<AdminUserDetail />} />
+                  <Route path="webhooks" element={<AdminWebhookSetup />} />
+                </Route>
+              )}
+              
+              <Route path="/oauth/facebook/callback" element={<FacebookCallback />} />
+              <Route path="/oauth/instagram/callback" element={<InstagramCallback />} />
+              <Route path="/deletion-status" element={<DeletionStatus />} />
+              <Route path="*" element={<Navigate to="/dashboard" replace />} />
+            </>
+          )}
+        </Routes>
+      </BrowserRouter>
+    </AppErrorBoundary>
+  );
+}
+
+export default App;
