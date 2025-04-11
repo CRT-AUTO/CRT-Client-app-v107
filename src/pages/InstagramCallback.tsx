@@ -13,6 +13,19 @@ export default function InstagramCallback() {
   const location = useLocation();
   const navigate = useNavigate();
 
+  // Function to determine the base URL for Netlify functions
+  const getNetlifyFunctionsBaseUrl = () => {
+    // In development or when no domain is set, use relative path
+    if (window.location.hostname === 'localhost' || 
+        window.location.hostname.includes('stackblitz') || 
+        window.location.hostname.includes('127.0.0.1')) {
+      return '/.netlify/functions';
+    }
+    
+    // In production with known domain, use the full URL
+    return 'https://crt-tech.org/.netlify/functions';
+  };
+
   const addDebugInfo = (message: string) => {
     console.log(message);
     setDebugInfo(prev => [...prev, `${new Date().toISOString().slice(11, 19)}: ${message}`]);
@@ -121,11 +134,31 @@ export default function InstagramCallback() {
         setStatus('exchanging_code');
         addDebugInfo('Exchanging authorization code for access token...');
         
-        const exchangeResponse = await fetch(`/.netlify/functions/exchangeToken?code=${code}`);
+        // Get the base URL for Netlify functions
+        const functionsBaseUrl = getNetlifyFunctionsBaseUrl();
+        const exchangeUrl = `${functionsBaseUrl}/exchangeToken?code=${code}`;
+        
+        addDebugInfo(`Making fetch request to: ${exchangeUrl}`);
+        
+        const exchangeResponse = await fetch(exchangeUrl, {
+          method: 'GET',
+          mode: 'cors',
+          credentials: 'same-origin',
+          headers: {
+            'Accept': 'application/json'
+          }
+        });
         
         if (!exchangeResponse.ok) {
-          const errorData = await exchangeResponse.json();
-          throw new Error(`Token exchange failed: ${errorData.error || 'Unknown error'}`);
+          const errorText = await exchangeResponse.text();
+          addDebugInfo(`Token exchange failed with status: ${exchangeResponse.status}, response: ${errorText}`);
+          
+          try {
+            const errorData = JSON.parse(errorText);
+            throw new Error(`Token exchange failed: ${errorData.error || 'Unknown error'}`);
+          } catch (jsonError) {
+            throw new Error(`Token exchange failed with status ${exchangeResponse.status}: ${errorText}`);
+          }
         }
         
         const tokenData = await exchangeResponse.json();
@@ -146,7 +179,14 @@ export default function InstagramCallback() {
           addDebugInfo('No Facebook pages found. Attempting to fetch pages directly...');
           
           try {
-            const pagesResponse = await fetch(`/.netlify/functions/getPageToken?token=${tokenData.accessToken}&pageId=me/accounts`);
+            const pagesResponse = await fetch(`${functionsBaseUrl}/getPageToken?token=${tokenData.accessToken}&pageId=me/accounts`, {
+              method: 'GET',
+              mode: 'cors',
+              credentials: 'same-origin',
+              headers: {
+                'Accept': 'application/json'
+              }
+            });
             
             if (!pagesResponse.ok) {
               const pageError = await pagesResponse.json();
@@ -174,7 +214,14 @@ export default function InstagramCallback() {
           try {
             addDebugInfo(`Checking Instagram accounts for page: ${page.name || page.id}`);
             
-            const igResponse = await fetch(`/.netlify/functions/getInstagramAccounts?token=${tokenData.accessToken}&pageId=${page.id}`);
+            const igResponse = await fetch(`${functionsBaseUrl}/getInstagramAccounts?token=${tokenData.accessToken}&pageId=${page.id}`, {
+              method: 'GET',
+              mode: 'cors',
+              credentials: 'same-origin',
+              headers: {
+                'Accept': 'application/json'
+              }
+            });
             
             if (igResponse.ok) {
               const igData = await igResponse.json();
@@ -197,7 +244,14 @@ export default function InstagramCallback() {
         
         // Get long-lived token for the page that owns the Instagram account
         addDebugInfo('Getting long-lived token...');
-        const longLivedTokenResponse = await fetch(`/.netlify/functions/getLongLivedToken?token=${tokenData.accessToken}`);
+        const longLivedTokenResponse = await fetch(`${functionsBaseUrl}/getLongLivedToken?token=${tokenData.accessToken}`, {
+          method: 'GET',
+          mode: 'cors',
+          credentials: 'same-origin',
+          headers: {
+            'Accept': 'application/json'
+          }
+        });
         
         if (!longLivedTokenResponse.ok) {
           const tokenError = await longLivedTokenResponse.json();
@@ -342,10 +396,18 @@ export default function InstagramCallback() {
           {/* Debug info section */}
           {debugInfo.length > 0 && (
             <div className="mt-6 p-3 bg-gray-50 rounded-md text-left">
-              <p className="text-xs text-gray-500 font-semibold mb-1">Debug Information:</p>
-              <div className="text-xs text-gray-500 max-h-40 overflow-y-auto">
+              <div className="flex justify-between items-center">
+                <p className="text-xs text-gray-500 font-semibold">Debug Information:</p>
+                <button 
+                  onClick={() => navigator.clipboard.writeText(JSON.stringify(debugInfo, null, 2))}
+                  className="text-xs text-indigo-600 hover:underline"
+                >
+                  Copy
+                </button>
+              </div>
+              <div className="text-xs text-gray-500 max-h-60 overflow-y-auto mt-1 space-y-1">
                 {debugInfo.map((info, idx) => (
-                  <div key={idx}>{info}</div>
+                  <div key={idx} className="bg-white p-1 rounded">{info}</div>
                 ))}
               </div>
             </div>
