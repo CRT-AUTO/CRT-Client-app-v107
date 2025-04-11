@@ -46,6 +46,19 @@ export async function statusChangeCallback(response: FacebookStatusResponse): Pr
   return handleFacebookStatusChange(response);
 }
 
+// Function to determine the base URL for Netlify functions
+function getNetlifyFunctionsBaseUrl() {
+  // In development or when no domain is set, use relative path
+  if (window.location.hostname === 'localhost' || 
+      window.location.hostname.includes('stackblitz') || 
+      window.location.hostname.includes('127.0.0.1')) {
+    return '/.netlify/functions';
+  }
+  
+  // In production with known domain, use the full URL
+  return 'https://crt-tech.org/.netlify/functions';
+}
+
 // Handle status change
 export function handleFacebookStatusChange(response: FacebookStatusResponse): Promise<boolean> {
   return new Promise(async (resolve) => {
