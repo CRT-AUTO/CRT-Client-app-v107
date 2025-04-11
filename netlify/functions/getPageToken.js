@@ -46,7 +46,26 @@ exports.handler = async (event, context) => {
   }
   
   try {
-    // Get page access token
+    // Special case for the "me/accounts" endpoint - returns list of pages
+    if (pageId === 'me/accounts') {
+      const response = await axios.get(`https://graph.facebook.com/v18.0/me/accounts`, {
+        params: {
+          access_token: userToken
+        }
+      });
+      
+      const pages = response.data.data || [];
+      
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({
+          pages: pages
+        })
+      };
+    }
+    
+    // Regular case - get token for a specific page
     console.log(`Getting page token for page ID: ${pageId}`);
     
     const response = await axios.get(`https://graph.facebook.com/v18.0/${pageId}`, {
@@ -65,17 +84,7 @@ exports.handler = async (event, context) => {
       };
     }
     
-    // Now exchange for a long-lived page token
-    const longLivedResponse = await axios.get('https://graph.facebook.com/v18.0/oauth/access_token', {
-      params: {
-        grant_type: 'fb_exchange_token',
-        client_id: process.env.VITE_META_APP_ID,
-        client_secret: process.env.META_APP_SECRET,
-        fb_exchange_token: response.data.access_token
-      }
-    });
-    
-    // Default expiry is 60 days for page tokens if not specified
+    // Calculate expiry date (60 days from now for page tokens)
     const expiryDate = new Date();
     expiryDate.setDate(expiryDate.getDate() + 60);
     
@@ -86,9 +95,7 @@ exports.handler = async (event, context) => {
         pageId: pageId,
         pageName: response.data.name,
         pageCategory: response.data.category,
-        accessToken: longLivedResponse.data.access_token || response.data.access_token,
-        // Facebook doesn't always return expires_in for page tokens as they're typically long-lived
-        expiresIn: longLivedResponse.data.expires_in || 5184000, // 60 days in seconds
+        accessToken: response.data.access_token,
         expiryDate: expiryDate.toISOString()
       })
     };
