@@ -27,6 +27,9 @@ function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [connectionRetries, setConnectionRetries] = useState(0);
   const [debugInfo, setDebugInfo] = useState<string[]>([]);
+  const [forceReset, setForceReset] = useState(false);
+  const [signOutInProgress, setSignOutInProgress] = useState(false);
+  const [initAttempted, setInitAttempted] = useState(false);
   const [forcedClearCompleted, setForcedClearCompleted] = useState(false);
   
   // Reference to store timeout ID for session refresh
@@ -37,40 +40,7 @@ function App() {
     setDebugInfo(prev => [...prev.slice(-9), message]);
   };
 
-  // Force sign out on first load to clear any stale sessions
-  // But only do this once and only if we're not returning from a Facebook auth flow
-  useEffect(() => {
-    const forceClearAuth = async () => {
-      // Check if we're returning from a Facebook flow
-      const isFacebookReturn = localStorage.getItem('fb_auth_state') !== null;
-      
-      // Skip forced sign out if we're returning from Facebook
-      if (isFacebookReturn) {
-        addDebugInfo("Skipping forced sign out due to Facebook auth return");
-        setForcedClearCompleted(true);
-        return;
-      }
-      
-      // Only attempt once and if not already completed
-      if (forcedClearCompleted) {
-        return;
-      }
-      
-      try {
-        addDebugInfo("Performing forced sign out to clear any stale sessions");
-        await clearSupabaseAuth();
-        addDebugInfo("Forced sign out completed");
-      } catch (err) {
-        addDebugInfo(`Error during forced sign out: ${err instanceof Error ? err.message : 'Unknown'}`);
-      } finally {
-        setForcedClearCompleted(true);
-      }
-    };
-    
-    forceClearAuth();
-  }, []);
-
-  // Setup session refresh mechanism
+  // Set up session refresh mechanism
   const setupSessionRefresh = useCallback((expiresAt: number) => {
     // Clear any existing timer
     if (refreshTimerRef.current) {
@@ -114,8 +84,69 @@ function App() {
   }, []);
 
   useEffect(() => {
+    // Only force sign out on initial load and specifically if returning from Facebook auth
+    const checkFacebookReturn = () => {
+      // Check if we're returning from a Facebook flow
+      const isFacebookReturn = localStorage.getItem('fb_auth_state') !== null;
+      return isFacebookReturn;
+    };
+    
+    // Force a sign out only in specific circumstances
+    const forceClearAuth = async () => {
+      // Skip forced sign out if we're returning from Facebook
+      const isFacebookReturn = checkFacebookReturn();
+      
+      if (isFacebookReturn) {
+        addDebugInfo("Skipping forced sign out due to Facebook auth return");
+        setForcedClearCompleted(true);
+        return;
+      }
+      
+      // Only attempt once 
+      if (signOutInProgress || initAttempted || forcedClearCompleted) {
+        return;
+      }
+      
+      try {
+        setSignOutInProgress(true);
+        setInitAttempted(true);
+        addDebugInfo("Performing forced sign out to clear any stale sessions");
+        await clearSupabaseAuth();
+        addDebugInfo("Forced sign out completed");
+        setForcedClearCompleted(true);
+      } catch (err) {
+        addDebugInfo(`Error during forced sign out: ${err instanceof Error ? err.message : 'Unknown'}`);
+        setForcedClearCompleted(true); // Mark as completed even on error to avoid retries
+      } finally {
+        setSignOutInProgress(false);
+      }
+    };
+    
+    // Check for Facebook return before running clearAuth
+    // We don't want to clear auth if we're returning from Facebook
+    if (window.location.pathname.includes('/oauth/facebook/callback') || 
+        window.location.pathname.includes('/oauth/instagram/callback') ||
+        checkFacebookReturn()) {
+      addDebugInfo("Detected OAuth return, skipping forced clear");
+      setForcedClearCompleted(true);
+    } else {
+      // Not an OAuth return, perform the force clear
+      forceClearAuth();
+    }
+  }, [forceReset]);
+
+  useEffect(() => {
     // Only initialize auth after forced sign-out completes
-    if (!forcedClearCompleted) return;
+    // or if we're returning from a Facebook auth flow
+    if (signOutInProgress) return;
+    
+    // Always attempt auth if we're returning from OAuth or have skipped forced clear
+    // This ensures OAuth flows can complete properly
+    const isFacebookReturn = localStorage.getItem('fb_auth_state') !== null;
+    const shouldAttemptAuth = forcedClearCompleted || isFacebookReturn || 
+                             window.location.pathname.includes('/oauth/');
+     
+    if (!shouldAttemptAuth) return;
     
     async function initializeAuth() {
       try {
@@ -136,9 +167,12 @@ function App() {
         }
 
         // Check if we're returning from Facebook OAuth
-        const isFacebookReturn = localStorage.getItem('fb_auth_state') !== null;
-        if (isFacebookReturn) {
-          addDebugInfo("Detected Facebook auth return, preventing additional session clears");
+        const isOAuthReturn = isFacebookReturn || 
+                             window.location.pathname.includes('/oauth/facebook/callback') ||
+                             window.location.pathname.includes('/oauth/instagram/callback');
+                             
+        if (isOAuthReturn) {
+          addDebugInfo("Detected OAuth return, preserving session state");
         }
 
         // If no session, we can stop here
@@ -165,11 +199,9 @@ function App() {
           
           if (!currentUser) {
             addDebugInfo("User data not found - session appears to be invalid");
-            // Don't automatically clear session if returning from Facebook
-            if (!isFacebookReturn) {
-              setUser(null);
-            } else {
-              addDebugInfo("Preserving session due to Facebook auth return");
+            
+            if (isOAuthReturn) {
+              addDebugInfo("Preserving session due to OAuth return");
               // Try again to get user data after a short delay
               setTimeout(async () => {
                 try {
@@ -182,7 +214,10 @@ function App() {
                   addDebugInfo(`Retry error: ${retryError instanceof Error ? retryError.message : 'Unknown'}`);
                 }
               }, 1000);
+            } else {
+              setUser(null);
             }
+            
             setAuthChecked(true);
             setLoading(false);
             return;
@@ -194,11 +229,11 @@ function App() {
           console.error('Error getting user data:', userError);
           addDebugInfo(`User data error: ${userError instanceof Error ? userError.message : 'Unknown'}`);
           
-          // Don't automatically clear session if returning from Facebook
-          if (!isFacebookReturn) {
+          // Don't automatically clear session if returning from OAuth
+          if (!isOAuthReturn) {
             setUser(null);
           } else {
-            addDebugInfo("Preserving user state due to Facebook auth return");
+            addDebugInfo("Preserving user state due to OAuth return");
           }
         }
         
@@ -212,14 +247,11 @@ function App() {
       }
     }
 
-    // Check if we're returning from Facebook OAuth flow
-    const isFacebookReturn = localStorage.getItem('fb_auth_state') !== null;
-
-    // Add a small delay before initializing auth to ensure Supabase is ready
-    // Make the delay shorter if we're returning from Facebook
     const initTimeout = setTimeout(() => {
-      initializeAuth();
-    }, isFacebookReturn ? 100 : connectionRetries * 300); // Shorter delay for Facebook returns
+      if (!signOutInProgress) {
+        initializeAuth();
+      }
+    }, 100); // Short delay to ensure sequential processing
 
     // Listen for auth state changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
@@ -268,23 +300,11 @@ function App() {
         refreshTimerRef.current = null;
       }
     };
-  }, [connectionRetries, setupSessionRefresh, forcedClearCompleted]);
-
-  // Add a timeout detection mechanism
-  useEffect(() => {
-    if (loading && !authChecked) {
-      // If loading takes more than 10 seconds, show a timeout warning
-      const timeoutWarning = setTimeout(() => {
-        addDebugInfo("Initialization seems to be taking longer than expected");
-      }, 10000);
-      
-      return () => clearTimeout(timeoutWarning);
-    }
-  }, [loading, authChecked]);
+  }, [connectionRetries, signOutInProgress, setupSessionRefresh, forcedClearCompleted]);
 
   // Add a heartbeat mechanism to periodically check session health
   useEffect(() => {
-    // Every 2 minutes, check session health
+    // Every 5 minutes, check session health (reduced from 2 minutes)
     const heartbeatInterval = setInterval(async () => {
       // Only run if user is supposed to be logged in
       if (user) {
@@ -304,24 +324,29 @@ function App() {
               addDebugInfo("Successfully recovered session");
             }
           } else {
-            // Log remaining time
+            // Log remaining time but only if it's close to expiry
             const expiresAt = new Date(session.expires_at * 1000);
             const now = new Date();
             const minutesRemaining = Math.round((expiresAt.getTime() - now.getTime()) / 60000);
-            addDebugInfo(`Session healthy, expires in ${minutesRemaining} minutes`);
+            
+            if (minutesRemaining < 30) {
+              // Only log if less than 30 minutes remain
+              addDebugInfo(`Session expiring soon: ${minutesRemaining} minutes remaining`);
+            }
           }
         } catch (err) {
           console.error('Error in heartbeat check:', err);
           addDebugInfo(`Heartbeat error: ${err instanceof Error ? err.message : 'Unknown'}`);
         }
       }
-    }, 120000); // 2 minutes
+    }, 300000); // 5 minutes (reduced frequency)
     
     return () => clearInterval(heartbeatInterval);
   }, [user]);
 
   const handleRetry = () => {
     setConnectionRetries(prev => prev + 1);
+    setForceReset(prev => !prev);
     addDebugInfo(`Retrying connection (attempt ${connectionRetries + 1})`);
   };
 
@@ -391,78 +416,4 @@ function App() {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <div className="text-center max-w-md">
-          <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 rounded-md mb-4">
-            {error}
-          </div>
-          <button
-            onClick={handleRetry}
-            className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
-          >
-            Retry
-          </button>
-          
-          <button
-            onClick={handleForceReset}
-            className="ml-2 inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500"
-          >
-            Reset & Go to Login
-          </button>
-          
-          {/* Debug information */}
-          {debugInfo.length > 0 && (
-            <div className="mt-8 p-4 bg-gray-100 rounded-md">
-              <h3 className="text-sm font-medium text-gray-700 mb-2">Debug Information:</h3>
-              <div className="text-xs text-gray-600 space-y-1">
-                {debugInfo.map((info, idx) => (
-                  <div key={idx} className="bg-white p-1 rounded">{info}</div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <AppErrorBoundary>
-      <ConnectionStatus onRetry={handleRetry} />
-      <BrowserRouter>
-        <Routes>
-          {!user ? (
-            <>
-              <Route path="/auth" element={<Auth />} />
-              <Route path="/deletion-status" element={<DeletionStatus />} />
-              <Route path="*" element={<Navigate to="/auth" replace />} />
-            </>
-          ) : (
-            <>
-              <Route element={<Layout />}>
-                <Route path="/dashboard" element={<Dashboard />} />
-                <Route path="/messages" element={<Messages />} />
-                <Route path="/messages/:id" element={<MessageDetail />} />
-                <Route path="/settings" element={<Settings />} />
-              </Route>
-              
-              {user.role === 'admin' && (
-                <Route path="/admin" element={<AdminLayout />}>
-                  <Route index element={<AdminDashboard />} />
-                  <Route path="users" element={<AdminUserManagement />} />
-                  <Route path="users/:userId" element={<AdminUserDetail />} />
-                  <Route path="webhooks" element={<AdminWebhookSetup />} />
-                </Route>
-              )}
-              
-              <Route path="/oauth/facebook/callback" element={<FacebookCallback />} />
-              <Route path="/oauth/instagram/callback" element={<InstagramCallback />} />
-              <Route path="/deletion-status" element={<DeletionStatus />} />
-              <Route path="*" element={<Navigate to="/dashboard" replace />} />
-            </>
-          )}
-        </Routes>
-      </BrowserRouter>
-    </AppErrorBoundary>
-  );
-}
-
-export default App;
+          <div className="bg-red-50 border b
