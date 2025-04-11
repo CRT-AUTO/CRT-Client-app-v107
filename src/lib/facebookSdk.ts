@@ -1,3 +1,4 @@
+// Facebook SDK manager for reliable SDK initialization and usage
 import { captureError } from './sentry';
 
 // Type definitions for Facebook SDK
@@ -15,6 +16,7 @@ declare global {
     FB: FacebookSDK;
     fbAsyncInit: () => void;
     fbSDKLoaded: boolean;
+    ENV: Record<string, string>;
   }
 }
 
@@ -50,7 +52,7 @@ export function initFacebookSDK(): Promise<void> {
       try {
         // Initialize the SDK
         window.FB.init({
-          appId: window.ENV.META_APP_ID, // Use the global variable instead of import.meta
+          appId: window.ENV.META_APP_ID, // Use the global variable
           cookie: true,
           xfbml: true,
           version: 'v18.0'
@@ -61,6 +63,10 @@ export function initFacebookSDK(): Promise<void> {
         console.log("Facebook SDK initialized successfully");
         isSDKInitialized = true;
         window.fbSDKLoaded = true;
+        
+        // Dispatch a custom event for components to listen for
+        const event = new Event('fbSDKLoaded');
+        document.dispatchEvent(event);
         
         // Call the original fbAsyncInit if it exists
         if (typeof originalFbAsyncInit === 'function') {
@@ -76,7 +82,9 @@ export function initFacebookSDK(): Promise<void> {
         resolve();
       } catch (error) {
         console.error("Error initializing Facebook SDK:", error);
-        captureError(error, { context: 'Facebook SDK initialization' });
+        if (error instanceof Error) {
+          captureError(error, { context: 'Facebook SDK initialization' });
+        }
         reject(error);
       }
     };
@@ -153,6 +161,12 @@ export function waitForFacebookSDK(timeoutMs: number = 10000): Promise<void> {
       
       reject(new Error(`Facebook SDK initialization timed out after ${timeoutMs}ms`));
     }, timeoutMs);
+    
+    // Clear timeout if SDK is loaded
+    document.addEventListener('fbSDKLoaded', () => {
+      clearTimeout(timeoutId);
+      resolve();
+    }, { once: true });
   });
 }
 
@@ -172,7 +186,10 @@ export async function getFacebookLoginStatus(): Promise<any> {
     });
   } catch (error) {
     console.error("Error getting Facebook login status:", error);
-    return { status: 'error', error: error instanceof Error ? error.message : String(error) };
+    return { 
+      status: 'error', 
+      error: error instanceof Error ? error.message : String(error) 
+    };
   }
 }
 
@@ -195,7 +212,10 @@ export async function loginWithFacebook(scope: string = "public_profile,email,pa
     });
   } catch (error) {
     console.error("Error during Facebook login:", error);
-    return { status: 'error', error: error instanceof Error ? error.message : String(error) };
+    return { 
+      status: 'error', 
+      error: error instanceof Error ? error.message : String(error) 
+    };
   }
 }
 
