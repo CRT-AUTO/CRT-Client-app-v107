@@ -85,38 +85,4 @@ exports.handler = async (event, context) => {
     }
     
     // Get more details about the Instagram Business account
-    const igAccountId = igResponse.data.instagram_business_account.id;
-    const igDetailResponse = await axios.get(`https://graph.facebook.com/v18.0/${igAccountId}`, {
-      params: {
-        fields: 'id,username,name,profile_picture_url',
-        access_token: pageToken
-      }
-    });
-    
-    // Return the Instagram account information and page token
-    return {
-      statusCode: 200,
-      headers,
-      body: JSON.stringify({
-        pageToken: pageToken,
-        instagramAccount: {
-          id: igDetailResponse.data.id,
-          username: igDetailResponse.data.username,
-          name: igDetailResponse.data.name || igDetailResponse.data.username,
-          profilePicture: igDetailResponse.data.profile_picture_url
-        }
-      })
-    };
-    
-  } catch (error) {
-    console.error('Error getting Instagram accounts:', error.response?.data || error.message);
-    
-    return {
-      statusCode: error.response?.status || 500,
-      headers,
-      body: JSON.stringify({ 
-        error: error.response?.data?.error?.message || error.message || 'Error retrieving Instagram accounts'
-      })
-    };
-  }
-};
+    const igAccountId = igResponse.data.instagram_business_account.
