@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { supabase, clearSupabaseAuth, refreshSupabaseToken, getSessionWithTimeout } from './lib/supabase';
+import { supabase, clearSupabaseAuth, refreshSupabaseToken, getSessionWithTimeout, getSessionWithRetry } from './lib/supabase';
 import { getCurrentUser } from './lib/auth';
 import Layout from './components/Layout';
 import Auth from './components/Auth';
@@ -32,6 +32,7 @@ function App() {
   const [initAttempted, setInitAttempted] = useState(false);
   const [forcedClearCompleted, setForcedClearCompleted] = useState(false);
   const [sessionCheckTimeout, setSessionCheckTimeout] = useState(false);
+  const [oauthReturnDetected, setOauthReturnDetected] = useState(false);
   
   // Reference to store timeout ID for session refresh
   const refreshTimerRef = useRef<number | null>(null);
@@ -41,10 +42,25 @@ function App() {
     setDebugInfo(prev => [...prev.slice(-9), message]);
   };
 
+  // Detect OAuth return early to prevent unnecessary authentication clearing
+  useEffect(() => {
+    // Check for OAuth return indicators in the URL or localStorage
+    const isOAuthReturn = 
+      window.location.pathname.includes('/oauth/facebook/callback') || 
+      window.location.pathname.includes('/oauth/instagram/callback') ||
+      localStorage.getItem('fb_auth_state') !== null;
+    
+    if (isOAuthReturn) {
+      addDebugInfo("Detected OAuth return, will skip forced auth clearing");
+      setOauthReturnDetected(true);
+    }
+  }, []);
+
   useEffect(() => {
     // Check for Facebook return before running clearAuth
     // We don't want to clear auth if we're returning from Facebook
-    if (window.location.pathname.includes('/oauth/facebook/callback') || 
+    if (oauthReturnDetected || 
+        window.location.pathname.includes('/oauth/facebook/callback') || 
         window.location.pathname.includes('/oauth/instagram/callback') ||
         localStorage.getItem('fb_auth_state') !== null) {
       addDebugInfo("Detected OAuth return, skipping forced clear");
@@ -83,7 +99,7 @@ function App() {
       
       forceClearAuth();
     }
-  }, [forceReset]);
+  }, [forceReset, oauthReturnDetected]);
 
   // Set up session refresh mechanism
   const setupSessionRefresh = useCallback((expiresAt: number) => {
@@ -152,7 +168,13 @@ function App() {
         addDebugInfo("Checking session");
         let sessionResult;
         try {
-          sessionResult = await getSessionWithTimeout(8000);
+          // For OAuth returns, use the enhanced retry version to handle 2FA scenarios
+          if (isFacebookReturn || window.location.pathname.includes('/oauth/')) {
+            addDebugInfo("Using enhanced session check with retry for OAuth return");
+            sessionResult = await getSessionWithRetry(15000, 1000);
+          } else {
+            sessionResult = await getSessionWithTimeout(8000);
+          }
         } catch (timeoutError) {
           addDebugInfo(`Session check timed out: ${timeoutError instanceof Error ? timeoutError.message : 'Unknown error'}`);
           setSessionCheckTimeout(true);
