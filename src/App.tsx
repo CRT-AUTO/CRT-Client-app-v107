@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { supabase, clearSupabaseAuth, refreshSupabaseToken } from './lib/supabase';
+import { supabase, clearSupabaseAuth, refreshSupabaseToken, getSessionWithTimeout } from './lib/supabase';
 import { getCurrentUser } from './lib/auth';
 import Layout from './components/Layout';
 import Auth from './components/Auth';
@@ -31,6 +31,7 @@ function App() {
   const [signOutInProgress, setSignOutInProgress] = useState(false);
   const [initAttempted, setInitAttempted] = useState(false);
   const [forcedClearCompleted, setForcedClearCompleted] = useState(false);
+  const [sessionCheckTimeout, setSessionCheckTimeout] = useState(false);
   
   // Reference to store timeout ID for session refresh
   const refreshTimerRef = useRef<number | null>(null);
@@ -39,49 +40,6 @@ function App() {
     console.log(`App initialization: ${message}`);
     setDebugInfo(prev => [...prev.slice(-9), message]);
   };
-
-  // Set up session refresh mechanism
-  const setupSessionRefresh = useCallback((expiresAt: number) => {
-    // Clear any existing timer
-    if (refreshTimerRef.current) {
-      clearTimeout(refreshTimerRef.current);
-      refreshTimerRef.current = null;
-    }
-    
-    const now = Date.now() / 1000; // current time in seconds
-    const timeUntilExpiry = expiresAt - now;
-    
-    // Set refresh to happen at 80% of the way to expiry
-    // For example, if token lasts 1 hour, refresh after 48 minutes
-    const refreshDelay = timeUntilExpiry * 0.8 * 1000; // convert to ms
-    
-    // Ensure we're not setting a negative delay or too short
-    const finalDelay = Math.max(refreshDelay, 5000);
-    
-    addDebugInfo(`Setting session refresh in ${Math.floor(finalDelay / 1000)} seconds`);
-    
-    refreshTimerRef.current = window.setTimeout(async () => {
-      addDebugInfo("Executing scheduled token refresh");
-      const success = await refreshSupabaseToken();
-      
-      if (success) {
-        addDebugInfo("Scheduled token refresh successful");
-        
-        // Check the new session to set up the next refresh
-        const { data: { session } } = await supabase.auth.getSession();
-        if (session) {
-          setupSessionRefresh(session.expires_at);
-        }
-      } else {
-        addDebugInfo("Scheduled token refresh failed - trying again soon");
-        // If refresh failed, try again soon
-        refreshTimerRef.current = window.setTimeout(() => {
-          refreshSupabaseToken();
-        }, 30000); // try again in 30 seconds
-      }
-    }, finalDelay);
-    
-  }, []);
 
   useEffect(() => {
     // Check for Facebook return before running clearAuth
@@ -127,6 +85,49 @@ function App() {
     }
   }, [forceReset]);
 
+  // Set up session refresh mechanism
+  const setupSessionRefresh = useCallback((expiresAt: number) => {
+    // Clear any existing timer
+    if (refreshTimerRef.current) {
+      clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = null;
+    }
+    
+    const now = Date.now() / 1000; // current time in seconds
+    const timeUntilExpiry = expiresAt - now;
+    
+    // Set refresh to happen at 80% of the way to expiry
+    // For example, if token lasts 1 hour, refresh after 48 minutes
+    const refreshDelay = timeUntilExpiry * 0.8 * 1000; // convert to ms
+    
+    // Ensure we're not setting a negative delay or too short
+    const finalDelay = Math.max(refreshDelay, 5000);
+    
+    addDebugInfo(`Setting session refresh in ${Math.floor(finalDelay / 1000)} seconds`);
+    
+    refreshTimerRef.current = window.setTimeout(async () => {
+      addDebugInfo("Executing scheduled token refresh");
+      const success = await refreshSupabaseToken();
+      
+      if (success) {
+        addDebugInfo("Scheduled token refresh successful");
+        
+        // Check the new session to set up the next refresh
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session) {
+          setupSessionRefresh(session.expires_at);
+        }
+      } else {
+        addDebugInfo("Scheduled token refresh failed - trying again soon");
+        // If refresh failed, try again soon
+        refreshTimerRef.current = window.setTimeout(() => {
+          refreshSupabaseToken();
+        }, 30000); // try again in 30 seconds
+      }
+    }, finalDelay);
+    
+  }, []);
+
   useEffect(() => {
     // Only initialize auth after forced sign-out completes
     // or if we're returning from a Facebook auth flow
@@ -144,11 +145,30 @@ function App() {
       try {
         setLoading(true);
         setError(null);
+        setSessionCheckTimeout(false);
         addDebugInfo("Starting initialization");
 
-        // Get the current session first
+        // Get the current session first with a timeout to prevent hanging
         addDebugInfo("Checking session");
-        const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+        let sessionResult;
+        try {
+          sessionResult = await getSessionWithTimeout(8000);
+        } catch (timeoutError) {
+          addDebugInfo(`Session check timed out: ${timeoutError instanceof Error ? timeoutError.message : 'Unknown error'}`);
+          setSessionCheckTimeout(true);
+          
+          // If we're returning from Facebook OAuth, we should try to continue anyway
+          if (isFacebookReturn || window.location.pathname.includes('/oauth/')) {
+            addDebugInfo("Session check timed out during OAuth return - attempting to continue");
+          } else {
+            setError('Session check timed out. Please try again or log in again.');
+            setLoading(false);
+            return;
+          }
+        }
+        
+        // Continue with session handling if we have a session result
+        const { data: { session } = { session: null }, error: sessionError } = sessionResult || {};
         
         if (sessionError) {
           console.error('Error getting session:', sessionError);
@@ -294,6 +314,20 @@ function App() {
     };
   }, [connectionRetries, signOutInProgress, setupSessionRefresh, forcedClearCompleted]);
 
+  // Add a timeout detection mechanism
+  useEffect(() => {
+    if (loading && !authChecked) {
+      // If loading takes more than 10 seconds, show a timeout warning
+      const timeoutWarning = setTimeout(() => {
+        if (loading && !authChecked) {
+          addDebugInfo("Initialization seems to be taking longer than expected");
+        }
+      }, 10000);
+      
+      return () => clearTimeout(timeoutWarning);
+    }
+  }, [loading, authChecked]);
+
   // Add a heartbeat mechanism to periodically check session health
   useEffect(() => {
     // Every 5 minutes, check session health (reduced from 2 minutes)
@@ -302,36 +336,42 @@ function App() {
       if (user) {
         try {
           addDebugInfo("Running session health check");
-          const { data: { session } } = await supabase.auth.getSession();
-          
-          if (!session) {
-            addDebugInfo("Session lost during heartbeat check");
-            // If session disappeared, try to recover it
-            const success = await refreshSupabaseToken();
-            if (!success) {
-              addDebugInfo("Failed to recover session, forcing re-auth");
-              setUser(null);
-              // Don't clear auth here, let user re-authenticate
-            } else {
-              addDebugInfo("Successfully recovered session");
-            }
-          } else {
-            // Log remaining time but only if it's close to expiry
-            const expiresAt = new Date(session.expires_at * 1000);
-            const now = new Date();
-            const minutesRemaining = Math.round((expiresAt.getTime() - now.getTime()) / 60000);
+          try {
+            // Use timeout version to prevent hanging
+            const result = await getSessionWithTimeout(5000);
+            const session = result.data?.session;
             
-            if (minutesRemaining < 30) {
-              // Only log if less than 30 minutes remain
-              addDebugInfo(`Session expiring soon: ${minutesRemaining} minutes remaining`);
+            if (!session) {
+              addDebugInfo("Session lost during heartbeat check");
+              // If session disappeared, try to recover it
+              const success = await refreshSupabaseToken();
+              if (!success) {
+                addDebugInfo("Failed to recover session, forcing re-auth");
+                setUser(null);
+                // Don't clear auth here, let user re-authenticate
+              } else {
+                addDebugInfo("Successfully recovered session");
+              }
+            } else {
+              // Log remaining time but only if it's close to expiry
+              const expiresAt = new Date(session.expires_at * 1000);
+              const now = new Date();
+              const minutesRemaining = Math.round((expiresAt.getTime() - now.getTime()) / 60000);
+              
+              if (minutesRemaining < 30) {
+                // Only log if less than 30 minutes remain
+                addDebugInfo(`Session expiring soon: ${minutesRemaining} minutes remaining`);
+              }
             }
+          } catch (timeoutError) {
+            addDebugInfo("Session health check timed out. This might indicate connectivity issues.");
           }
         } catch (err) {
           console.error('Error in heartbeat check:', err);
           addDebugInfo(`Heartbeat error: ${err instanceof Error ? err.message : 'Unknown'}`);
         }
       }
-    }, 300000); // 5 minutes (reduced frequency)
+    }, 300000); // 5 minutes
     
     return () => clearInterval(heartbeatInterval);
   }, [user]);
@@ -339,6 +379,7 @@ function App() {
   const handleRetry = () => {
     setConnectionRetries(prev => prev + 1);
     setForceReset(prev => !prev);
+    setSessionCheckTimeout(false);
     addDebugInfo(`Retrying connection (attempt ${connectionRetries + 1})`);
   };
 
@@ -369,6 +410,15 @@ function App() {
       <div className="min-h-screen flex flex-col items-center justify-center">
         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mb-4"></div>
         <p className="text-gray-600">Initializing application...</p>
+        
+        {sessionCheckTimeout && (
+          <div className="mt-4 text-amber-600 text-sm flex items-center">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+            </svg>
+            Session check is taking longer than expected. The server might be busy.
+          </div>
+        )}
         
         {/* Debug information */}
         {debugInfo.length > 0 && (
