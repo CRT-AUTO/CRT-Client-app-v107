@@ -209,12 +209,12 @@ export async function checkSupabaseDB(): Promise<{success: boolean, error?: stri
   }
 }
 
-// Function to clear any stored sessions - improved to be more thorough
+// Function to clear any stored sessions
 export async function clearSupabaseAuth() {
   try {
     console.log('Attempting to clear Supabase auth session...');
     
-    // Collect all keys to remove
+    // Collect keys to remove
     const keysToRemove: string[] = [];
     
     // Find all Supabase-related localStorage keys
@@ -234,7 +234,7 @@ export async function clearSupabaseAuth() {
       try {
         console.log('Calling supabase.auth.signOut()'); 
         const { error } = await supabase.auth.signOut({ 
-          scope: 'global' // Use global to clear all sessions, not just the local one
+          scope: 'local' // Using 'local' instead of 'global' to only affect this browser
         });
         
         if (error) {
@@ -252,22 +252,11 @@ export async function clearSupabaseAuth() {
       for (const key of keysToRemove) {
         try {
           localStorage.removeItem(key);
-          console.log(`Removed localStorage item: ${key}`);
         } catch (removeError) {
           console.warn(`Error removing localStorage item ${key}:`, removeError);
         }
       }
-    } else {
-      console.log('No Supabase-related localStorage items found to remove');
     }
-    
-    // Extra safety measure - clear any session-related cookies
-    document.cookie.split(';').forEach(cookie => {
-      const [name] = cookie.split('=');
-      if (name.trim().includes('supabase') || name.trim().includes('sb-')) {
-        document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;`;
-      }
-    });
     
     console.log('Successfully cleared auth session');
     return true;
