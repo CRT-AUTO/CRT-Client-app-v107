@@ -17,7 +17,6 @@ export default function Auth({ initialError = null }: AuthProps) {
   const [authResult, setAuthResult] = useState<any>(null);
   const [sessionCleared, setSessionCleared] = useState(false);
   const [isRestoringFacebookAuth, setIsRestoringFacebookAuth] = useState(false);
-  const [forcedClearAttempted, setForcedClearAttempted] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -73,35 +72,30 @@ export default function Auth({ initialError = null }: AuthProps) {
     checkForFacebookRedirect();
   }, [location, navigate]);
 
-  // Force a cleanup of any existing session when this component mounts,
+  // Perform a single cleanup of any existing session when this component mounts,
   // but only if we're not in the process of restoring a Facebook auth
   useEffect(() => {
     const cleanupSession = async () => {
-      // Skip session cleanup if we're restoring Facebook auth or already attempted
-      if (isRestoringFacebookAuth || forcedClearAttempted) {
-        if (isRestoringFacebookAuth) {
-          addDebugInfo('Skipping session cleanup because we are restoring Facebook auth');
-        } else {
-          addDebugInfo('Skipping session cleanup because we already attempted it');
-        }
+      // Skip session cleanup if we're restoring Facebook auth
+      if (isRestoringFacebookAuth) {
+        addDebugInfo('Skipping session cleanup because we are restoring Facebook auth');
         setSessionCleared(true);
         return;
       }
 
       try {
-        addDebugInfo("Performing forced sign out to clear any stale sessions");
+        addDebugInfo("Performing sign out to ensure a clean session state");
         await clearSupabaseAuth();
-        addDebugInfo("Forced sign out completed");
-        setForcedClearAttempted(true);
+        addDebugInfo("Sign out completed");
       } catch (err) {
-        addDebugInfo(`Error during forced sign out: ${err instanceof Error ? err.message : 'Unknown'}`);
+        addDebugInfo(`Error during sign out: ${err instanceof Error ? err.message : 'Unknown'}`);
       } finally {
         setSessionCleared(true);
       }
     };
     
     cleanupSession();
-  }, [isRestoringFacebookAuth, forcedClearAttempted]);
+  }, [isRestoringFacebookAuth]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -110,11 +104,6 @@ export default function Auth({ initialError = null }: AuthProps) {
     addDebugInfo(`Attempting ${isSignUp ? 'signup' : 'login'} with email: ${email}`);
 
     try {
-      // First clear any existing sessions again to be 100% sure
-      if (!isRestoringFacebookAuth) {
-        await clearSupabaseAuth();
-      }
-      
       let result;
       
       if (isSignUp) {
@@ -176,7 +165,7 @@ export default function Auth({ initialError = null }: AuthProps) {
         <div className="sm:mx-auto sm:w-full sm:max-w-md text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto mb-4"></div>
           <h2 className="text-xl font-medium text-gray-900">Preparing Authentication</h2>
-          <p className="mt-2 text-sm text-gray-500">Clearing any existing sessions...</p>
+          <p className="mt-2 text-sm text-gray-500">Setting up secure session...</p>
         </div>
       </div>
     );
