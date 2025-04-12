@@ -58,7 +58,7 @@ export default function Auth({ initialError = null }: AuthProps) {
               const ageInMinutes = (Date.now() - savedState.timestamp) / (60 * 1000);
               addDebugInfo(`OAuth auth state is ${ageInMinutes.toFixed(1)} minutes old`);
               
-              if (ageInMinutes > 15) {
+              if (ageInMinutes > 30) { // Increased from 15 to 30 minutes
                 // State is too old, remove it
                 localStorage.removeItem('fb_auth_state');
                 addDebugInfo('Removed stale OAuth auth state');
