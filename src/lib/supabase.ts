@@ -130,7 +130,7 @@ export async function getSessionWithTimeout(timeoutMs = 10000): Promise<any> {
  * This function will retry multiple times with increasing delays
  * to handle 2FA scenarios in OAuth return
  */
-export async function getSessionWithRetry(maxTimeMs = 15000, initialDelayMs = 1000): Promise<any> {
+export async function getSessionWithRetry(maxTimeMs = 30000, initialDelayMs = 1500): Promise<any> {
   const startTime = Date.now();
   let attempt = 1;
   let lastError: Error | null = null;
@@ -139,7 +139,7 @@ export async function getSessionWithRetry(maxTimeMs = 15000, initialDelayMs = 10
   
   while (Date.now() - startTime < maxTimeMs) {
     try {
-      const result = await getSessionWithTimeout(5000);
+      const result = await getSessionWithTimeout(8000); // Increased from 5000 to 8000ms
       if (result?.data?.session) {
         console.log(`Session found on attempt ${attempt}`);
         return result;
@@ -150,7 +150,7 @@ export async function getSessionWithRetry(maxTimeMs = 15000, initialDelayMs = 10
       // Exponential backoff with jitter
       const delay = Math.min(
         initialDelayMs * Math.pow(1.5, attempt - 1) * (0.8 + Math.random() * 0.4),
-        3000 // Cap maximum delay at 3 seconds
+        5000 // Cap maximum delay at 5 seconds (increased from 3s)
       );
       
       // Wait before the next attempt
@@ -161,7 +161,7 @@ export async function getSessionWithRetry(maxTimeMs = 15000, initialDelayMs = 10
       console.warn(`Session check attempt ${attempt} failed:`, lastError.message);
       
       // Shorter delay on error to try again quickly
-      await new Promise(resolve => setTimeout(resolve, 800));
+      await new Promise(resolve => setTimeout(resolve, initialDelayMs / 2));
       attempt++;
     }
   }
@@ -180,7 +180,7 @@ export async function checkSupabaseAuth() {
       return false;
     }
     
-    const { data: { session }, error } = await getSessionWithTimeout(5000);
+    const { data: { session }, error } = await getSessionWithTimeout(8000); // Increased from 5000 to 8000ms
     
     if (error) {
       console.error('Supabase authentication check failed:', error);
@@ -264,7 +264,7 @@ export async function checkSupabaseDB(): Promise<{success: boolean, error?: stri
     
     // Fallback to session check
     console.log('Falling back to session check...');
-    const { data, error } = await getSessionWithTimeout(5000);
+    const { data, error } = await getSessionWithTimeout(8000); // Increased from 5000 to 8000ms
     
     if (error) {
       console.error('Database connection check failed:', error);
@@ -358,7 +358,7 @@ export async function refreshSupabaseToken(): Promise<boolean> {
     console.log('Attempting to refresh Supabase token...');
     
     // Check if we have a session first
-    const { data: { session }, error: sessionError } = await getSessionWithTimeout(5000);
+    const { data: { session }, error: sessionError } = await getSessionWithTimeout(8000); // Increased timeout
     
     if (sessionError) {
       console.error('Error getting session for refresh:', sessionError);
