@@ -1,133 +1,155 @@
+// src/pages/Settings.tsx
 import React, { useState, useEffect } from 'react';
-import { Facebook, Instagram, Bot, Trash2, Book, AlertTriangle, Globe, User, Lock, ShieldCheck } from 'lucide-react';
+import {
+  Facebook,
+  Instagram,
+  Bot,
+  Trash2,
+  Book,
+  AlertTriangle,
+  Globe,
+  User,
+  Lock,
+  ShieldCheck
+} from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { getSocialConnections, getWebhookConfigsByUserId } from '../lib/api';
 import { logout } from '../lib/auth';
-import { checkFacebookLoginStatus, loginWithFacebook } from '../lib/facebookAuth';
+import {
+  checkFacebookLoginStatus,
+  loginWithFacebook,
+  is2FAError
+} from '../lib/facebookAuth';
 import { waitForFacebookSDK, isFacebookSDKReady } from '../lib/facebookSdk';
 import type { SocialConnection, WebhookConfig } from '../types';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorAlert from '../components/ErrorAlert';
 import FacebookLoginButton from '../components/FacebookLoginButton';
 
+// Define allowed tab names using a union type for better type safety.
+type SettingsTab = 'account' | 'connections' | 'privacy';
+
 export default function Settings() {
+  // STATES
   const [socialConnections, setSocialConnections] = useState<SocialConnection[]>([]);
   const [webhookConfigs, setWebhookConfigs] = useState<WebhookConfig[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState('account');
+  const [activeTab, setActiveTab] = useState<SettingsTab>('account');
   const [error, setError] = useState<string | null>(null);
   const [fbConnecting, setFbConnecting] = useState(false);
   const [userEmail, setUserEmail] = useState<string>('');
   const [userSince, setUserSince] = useState<string>('');
   const [fbDebugInfo, setFbDebugInfo] = useState<string[]>([]);
 
+  // HELPER: Append a debug message with a timestamp.
+  const addFbDebugInfo = (message: string) => {
+    const timestamp = new Date().toISOString().slice(11, 19);
+    console.log(`Facebook Connect: ${message}`);
+    setFbDebugInfo(prev => [...prev.slice(-9), `${timestamp}: ${message}`]);
+  };
+
+  // HELPER: Retrieve Facebook and Instagram connection info from socialConnections.
+  const getFacebookConnection = (): SocialConnection | undefined =>
+    socialConnections.find(conn => !!conn.fb_page_id);
+  const getInstagramConnection = (): SocialConnection | undefined =>
+    socialConnections.find(conn => !!conn.ig_account_id);
+
+  // Load initial user data, social connections, and webhook configs.
   useEffect(() => {
-    async function loadData() {
+    const loadData = async () => {
       try {
         setLoading(true);
         setError(null);
-        
-        // Get the current user
+
+        // Get current authenticated user.
         const { data: userData } = await supabase.auth.getUser();
         if (!userData.user) {
           throw new Error('User not authenticated');
         }
-
         setUserEmail(userData.user.email || '');
         setUserSince(new Date(userData.user.created_at || Date.now()).toLocaleDateString());
-        
-        // Load social connections
+
+        // Load social connections.
         try {
           const connections = await getSocialConnections();
           setSocialConnections(connections);
         } catch (connError) {
           console.error('Error loading social connections:', connError);
-          // Continue loading other data
+          // Proceed even if social connections fail.
         }
-        
-        // Load webhook configs
+
+        // Load webhook configs.
         try {
           const webhooks = await getWebhookConfigsByUserId(userData.user.id);
           setWebhookConfigs(webhooks);
         } catch (webhookError) {
           console.error('Error loading webhook configs:', webhookError);
-          // Continue loading other data
+          // Continue even if webhook configs fail.
         }
-      } catch (error) {
-        console.error('Error loading data:', error);
-        setError(error instanceof Error ? error.message : 'Failed to load settings data');
+      } catch (err) {
+        console.error('Error loading data:', err);
+        setError(err instanceof Error ? err.message : 'Failed to load settings data');
       } finally {
         setLoading(false);
       }
-    }
+    };
 
     loadData();
   }, []);
 
-  const getFacebookConnection = () => {
-    return socialConnections.find(conn => conn.fb_page_id);
-  };
-  
-  const getInstagramConnection = () => {
-    return socialConnections.find(conn => conn.ig_account_id);
-  };
-  
-  const addFbDebugInfo = (message: string) => {
-    console.log(`Facebook Connect: ${message}`);
-    setFbDebugInfo(prev => [...prev.slice(-9), message]);
-  };
+  // HANDLERS FOR CONNECTING SOCIAL ACCOUNTS
 
+  // Handles Facebook connection via SDK and falls back to direct OAuth when needed.
   const handleFacebookConnect = async () => {
     setFbConnecting(true);
     setError(null);
-    
+
     try {
       addFbDebugInfo("Starting Facebook connection process");
-      
-      // Check if FB SDK is properly loaded
+
+      // Check if FB SDK is ready
       const isSdkReady = isFacebookSDKReady();
       addFbDebugInfo(`Facebook SDK status: ${isSdkReady ? 'Ready' : 'Not Ready'}`);
-      
+
       if (!isSdkReady) {
-        // Wait for the SDK to initialize
         addFbDebugInfo("Waiting for Facebook SDK to initialize...");
-        
-        try {
-          await waitForFacebookSDK(5000); // Wait up to 5 seconds
-          addFbDebugInfo("Facebook SDK initialized successfully");
-        } catch (sdkError) {
-          addFbDebugInfo(`SDK initialization failed: ${sdkError instanceof Error ? sdkError.message : 'Unknown error'}`);
-          // Fall back to direct OAuth flow
-          handleDirectOAuthFlow();
-          return;
-        }
+        await waitForFacebookSDK(8000); // Wait up to 8 seconds
+        addFbDebugInfo("Facebook SDK initialized successfully");
       }
-      
-      // Check login status now that we know SDK is ready
+
+      // Check current login status using SDK.
       addFbDebugInfo("Checking Facebook login status");
       const statusResponse = await checkFacebookLoginStatus();
-      
       addFbDebugInfo(`Facebook status: ${statusResponse.status}`);
-      
+
+      // If a 2FA error is detected, use the direct OAuth flow.
+      if (statusResponse.error && is2FAError(statusResponse)) {
+        addFbDebugInfo("Detected 2FA challenge, using direct OAuth flow with auth_type=rerequest");
+        handleDirectOAuthFlow(true);
+        return;
+      }
+
       if (statusResponse.status === 'connected' && statusResponse.authResponse) {
-        // User is already logged into Facebook and authorized the app
-        addFbDebugInfo("User already connected to Facebook, proceeding to page selection");
-        // The handleFacebookStatusChange function will handle the redirect
+        addFbDebugInfo("User already connected to Facebook, proceeding with SDK login");
         await loginWithFacebook();
       } else if (statusResponse.status === 'error') {
-        // SDK error occurred, fall back to direct OAuth
         addFbDebugInfo("Facebook SDK error, falling back to direct OAuth");
         handleDirectOAuthFlow();
       } else {
-        // User needs to log in or authorize the app
         addFbDebugInfo(`Initiating login flow (status: ${statusResponse.status})`);
-        
         const loginResponse = await loginWithFacebook();
-        
+
+        // Check again for 2FA error.
+        if (loginResponse.error && is2FAError(loginResponse)) {
+          addFbDebugInfo("Detected 2FA challenge during login, using direct OAuth flow with auth_type=rerequest");
+          handleDirectOAuthFlow(true);
+          return;
+        }
+
         if (loginResponse.status === 'connected') {
-          addFbDebugInfo("Facebook login successful, redirect should happen automatically");
+          addFbDebugInfo("Facebook login successful via SDK");
         } else if (loginResponse.status === 'error') {
-          addFbDebugInfo("Error during Facebook login, falling back to direct OAuth");
+          addFbDebugInfo("Error during Facebook login via SDK, falling back to direct OAuth");
           handleDirectOAuthFlow();
         } else {
           addFbDebugInfo(`Facebook login was not successful: ${loginResponse.status}`);
@@ -138,23 +160,21 @@ export default function Settings() {
       console.error('Error connecting to Facebook:', err);
       addFbDebugInfo(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
       setError(err instanceof Error ? err.message : 'Failed to connect to Facebook');
-      
-      // Fall back to direct OAuth as a last resort
+      // Fall back to direct OAuth as a last resort.
       handleDirectOAuthFlow();
     } finally {
       setFbConnecting(false);
     }
   };
 
-  // Helper function for direct OAuth flow
-  const handleDirectOAuthFlow = async () => {
-    addFbDebugInfo("Using direct OAuth flow");
-    
-    // Save the current auth session in localStorage before redirecting
+  // Direct OAuth fallback for when the SDK is not reliable or 2FA issues are encountered.
+  const handleDirectOAuthFlow = async (is2FAFlow: boolean = false) => {
+    addFbDebugInfo(`Using direct OAuth flow${is2FAFlow ? ' (2FA mode)' : ''}`);
+
     try {
       const { data: { session } } = await supabase.auth.getSession();
       if (session) {
-        // Store a minimal version of the session to maintain auth state
+        // Save minimal session state for restoration.
         localStorage.setItem('fb_auth_state', JSON.stringify({
           userId: session.user.id,
           expiresAt: session.expires_at,
@@ -165,60 +185,51 @@ export default function Settings() {
     } catch (sessionError) {
       addFbDebugInfo(`Error saving auth state: ${sessionError instanceof Error ? sessionError.message : 'Unknown error'}`);
     }
-    
-    // IMPORTANT: Use the fixed redirect URL that matches your Meta app configuration
+
     const redirectUri = `https://crt-tech.org/oauth/facebook/callback`;
     const appId = window.ENV?.META_APP_ID;
-    
     if (!appId) {
       throw new Error('Facebook App ID is missing in environment variables');
     }
-    
-    addFbDebugInfo(`Redirecting to Facebook OAuth URL with fixed redirect: ${redirectUri}`);
-    window.location.href = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=public_profile,email,pages_show_list,pages_messaging&response_type=code`;
+    const authTypeParam = is2FAFlow ? '&auth_type=rerequest' : '';
+    addFbDebugInfo(`Redirecting to Facebook OAuth URL with redirect: ${redirectUri}`);
+    window.location.href = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent("public_profile,email,pages_show_list,pages_messaging")}&response_type=code${authTypeParam}`;
   };
 
+  // Handles Instagram connection in a similar manner.
   const handleInstagramConnect = () => {
-    // Save the current auth session in localStorage before redirecting
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (session) {
-        // Store a minimal version of the session to maintain auth state
         localStorage.setItem('fb_auth_state', JSON.stringify({
           userId: session.user.id,
           expiresAt: session.expires_at,
           timestamp: Date.now()
         }));
       }
-      
-      const redirectUri = `${window.location.origin}/oauth/instagram/callback`;
-      window.location.href = `https://api.instagram.com/oauth/authorize?client_id=${window.ENV?.META_APP_ID}&redirect_uri=${redirectUri}&scope=instagram_basic,instagram_manage_messages&response_type=code`;
+      const redirectUri = `https://crt-tech.org/oauth/instagram/callback`;
+      window.location.href = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${window.ENV?.META_APP_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent("public_profile,email,pages_show_list,pages_messaging,instagram_basic,instagram_manage_messages")}&response_type=code`;
     }).catch(error => {
       console.error('Error getting session:', error);
       setError('Failed to prepare for Instagram connection');
     });
   };
-  
+
+  // Handler for disconnecting a social account.
   const handleDisconnectSocial = async (connectionId: string) => {
     if (!connectionId) {
       setError("No connection ID provided");
       return;
     }
-    
     if (!confirm('Are you sure you want to disconnect this account?')) return;
-    
     try {
       const { error } = await supabase
         .from('social_connections')
         .delete()
         .eq('id', connectionId);
-        
       if (error) throw error;
-      
-      // Update the list by removing the deleted connection
-      setSocialConnections(prevConnections => 
-        prevConnections.filter(conn => conn.id !== connectionId)
+      setSocialConnections(prev =>
+        prev.filter(conn => conn.id !== connectionId)
       );
-      
       alert('Successfully disconnected account');
     } catch (error) {
       console.error('Error disconnecting account:', error);
@@ -226,13 +237,14 @@ export default function Settings() {
     }
   };
 
+  // Data deletion handler.
   const handleDataDeletion = () => {
     if (window.confirm('Are you sure you want to request deletion of all your data? This action cannot be undone.')) {
-      // In a real implementation, you would call your API to initiate the data deletion process
       window.location.href = '/deletion-status?code=MANUAL' + Math.random().toString(36).substring(2, 10).toUpperCase();
     }
   };
 
+  // Sign-out handler.
   const handleSignOut = async () => {
     try {
       await logout();
@@ -243,60 +255,49 @@ export default function Settings() {
     }
   };
 
+  // RENDERING
   if (loading) {
     return <LoadingIndicator message="Loading settings..." />;
   }
 
   return (
     <div className="space-y-6">
+      {/* Navigation Tabs */}
       <div className="border-b border-gray-200">
         <nav className="-mb-px flex space-x-8">
-          <button
-            onClick={() => setActiveTab('account')}
-            className={`${
-              activeTab === 'account'
-                ? 'border-indigo-500 text-indigo-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            } whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm`}
-          >
-            Account Settings
-          </button>
-          <button
-            onClick={() => setActiveTab('connections')}
-            className={`${
-              activeTab === 'connections'
-                ? 'border-indigo-500 text-indigo-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            } whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm`}
-          >
-            Social Connections
-          </button>
-          <button
-            onClick={() => setActiveTab('privacy')}
-            className={`${
-              activeTab === 'privacy'
-                ? 'border-indigo-500 text-indigo-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            } whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm`}
-          >
-            Privacy & Data
-          </button>
+          {(['account', 'connections', 'privacy'] as SettingsTab[]).map(tab => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className={`whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm ${
+                activeTab === tab
+                  ? 'border-indigo-500 text-indigo-600'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+              }`}
+            >
+              {tab === 'account'
+                ? 'Account Settings'
+                : tab === 'connections'
+                ? 'Social Connections'
+                : 'Privacy & Data'}
+            </button>
+          ))}
         </nav>
       </div>
 
       {error && (
-        <ErrorAlert 
-          message="Error" 
-          details={error} 
-          onDismiss={() => setError(null)} 
+        <ErrorAlert
+          message="Error"
+          details={error}
+          onDismiss={() => setError(null)}
         />
       )}
-      
+
+      {/* ACCOUNT TAB */}
       {activeTab === 'account' && (
         <div className="bg-white shadow rounded-lg">
           <div className="px-4 py-5 sm:p-6">
             <h3 className="text-lg leading-6 font-medium text-gray-900 mb-4">Account Information</h3>
-            
             <div className="space-y-6">
               <div className="flex items-center">
                 <div className="bg-indigo-100 rounded-full p-3 mr-4">
@@ -307,7 +308,6 @@ export default function Settings() {
                   <p className="mt-1 text-lg text-gray-900">{userEmail}</p>
                 </div>
               </div>
-              
               <div className="flex items-center">
                 <div className="bg-green-100 rounded-full p-3 mr-4">
                   <ShieldCheck className="h-6 w-6 text-green-600" />
@@ -317,7 +317,6 @@ export default function Settings() {
                   <p className="mt-1 text-lg text-gray-900">Customer</p>
                 </div>
               </div>
-              
               <div className="flex items-center">
                 <div className="bg-blue-100 rounded-full p-3 mr-4">
                   <Globe className="h-6 w-6 text-blue-600" />
@@ -327,7 +326,6 @@ export default function Settings() {
                   <p className="mt-1 text-lg text-gray-900">{userSince}</p>
                 </div>
               </div>
-              
               <div className="pt-5 border-t border-gray-200">
                 <button
                   onClick={handleSignOut}
@@ -340,7 +338,8 @@ export default function Settings() {
           </div>
         </div>
       )}
-      
+
+      {/* CONNECTIONS TAB */}
       {activeTab === 'connections' && (
         <div className="bg-white shadow rounded-lg">
           <div className="px-4 py-5 sm:p-6">
@@ -348,13 +347,12 @@ export default function Settings() {
             <p className="mt-1 text-sm text-gray-500">
               Connect your social media accounts to use with the AI assistant
             </p>
-            
             <div className="mt-5 space-y-4">
+              {/* Facebook Connection */}
               <div className="border rounded-md overflow-hidden">
                 <div className="bg-gray-50 px-4 py-3 border-b">
                   <h4 className="text-sm font-medium text-gray-700">Facebook Pages</h4>
                 </div>
-                
                 {getFacebookConnection() ? (
                   <div className="p-4">
                     <div className="flex items-center justify-between">
@@ -378,8 +376,8 @@ export default function Settings() {
                 ) : (
                   <div className="p-4">
                     <div className="mb-4">
-                      <FacebookLoginButton 
-                        onLoginSuccess={() => console.log('Facebook login successful')} 
+                      <FacebookLoginButton
+                        onLoginSuccess={() => console.log('Facebook login successful')}
                         onLoginFailure={(err) => {
                           setError(err);
                           addFbDebugInfo(`Login failure: ${err}`);
@@ -387,13 +385,11 @@ export default function Settings() {
                         scope="public_profile,email,pages_show_list,pages_messaging"
                       />
                     </div>
-                    
                     <div className="text-center mt-3">
                       <span className="inline-block border-t border-gray-300 w-full relative">
                         <span className="px-2 bg-white relative -top-3 text-xs text-gray-500">or</span>
                       </span>
                     </div>
-                    
                     <div className="mt-3 text-center">
                       <button
                         onClick={handleFacebookConnect}
@@ -413,7 +409,6 @@ export default function Settings() {
                         )}
                       </button>
                     </div>
-                    
                     {fbDebugInfo.length > 0 && (
                       <div className="mt-4 p-3 bg-gray-50 rounded-md">
                         <p className="text-xs text-gray-700 font-medium">Connection Status:</p>
@@ -427,12 +422,11 @@ export default function Settings() {
                   </div>
                 )}
               </div>
-              
+              {/* Instagram Connection */}
               <div className="border rounded-md overflow-hidden">
                 <div className="bg-gray-50 px-4 py-3 border-b">
                   <h4 className="text-sm font-medium text-gray-700">Instagram Business Account</h4>
                 </div>
-                
                 {getInstagramConnection() ? (
                   <div className="p-4">
                     <div className="flex items-center justify-between">
@@ -465,7 +459,7 @@ export default function Settings() {
                   </div>
                 )}
               </div>
-              
+              {/* No Connections Message */}
               {(!getFacebookConnection() && !getInstagramConnection()) && (
                 <div className="bg-yellow-50 border-l-4 border-yellow-400 p-4 mt-4">
                   <div className="flex">
@@ -485,6 +479,7 @@ export default function Settings() {
         </div>
       )}
 
+      {/* PRIVACY TAB */}
       {activeTab === 'privacy' && (
         <div className="space-y-6">
           <div className="bg-white shadow rounded-lg">
@@ -493,7 +488,6 @@ export default function Settings() {
               <p className="mt-2 text-sm text-gray-500">
                 Manage your data and privacy settings. You can request deletion of your data at any time.
               </p>
-
               <div className="mt-6 border-t border-gray-200 pt-6">
                 <h4 className="text-md font-medium text-gray-900">Data Deletion</h4>
                 <p className="mt-2 text-sm text-gray-500">
@@ -509,7 +503,6 @@ export default function Settings() {
                   </button>
                 </div>
               </div>
-
               <div className="mt-6 border-t border-gray-200 pt-6">
                 <h4 className="text-md font-medium text-gray-900">Facebook Data Deletion</h4>
                 <p className="mt-2 text-sm text-gray-500">
@@ -531,7 +524,6 @@ export default function Settings() {
                   </a>
                 </div>
               </div>
-
               <div className="mt-6 border-t border-gray-200 pt-6">
                 <h4 className="text-md font-medium text-gray-900">Privacy Policy</h4>
                 <p className="mt-2 text-sm text-gray-500">
@@ -555,3 +547,5 @@ export default function Settings() {
     </div>
   );
 }
+
+export default Settings;
