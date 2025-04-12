@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { handleFacebookStatusChange } from '../lib/facebookAuth';
+import { handleFacebookStatusChange, is2FAError } from '../lib/facebookAuth';
 import { waitForFacebookSDK, parseXFBML, isFacebookSDKReady, loginWithFacebook } from '../lib/facebookSdk';
 import { AlertTriangle } from 'lucide-react';
 import { supabase } from '../lib/supabase';
@@ -33,6 +33,7 @@ const FacebookLoginButton: React.FC<FacebookLoginButtonProps> = ({
   const [sdkError, setSdkError] = useState('');
   const [buttonRendered, setButtonRendered] = useState(false);
   const [sdkCheckAttempts, setSdkCheckAttempts] = useState(0);
+  const [is2FADetected, setIs2FADetected] = useState(false);
 
   // Define the global callback function that the FB button will call
   useEffect(() => {
@@ -60,14 +61,24 @@ const FacebookLoginButton: React.FC<FacebookLoginButtonProps> = ({
         }
       } catch (error) {
         console.error("Error in checkLoginState:", error);
-        setSdkError("Error checking login state. Please try again.");
-        if (onLoginFailure) onLoginFailure("Error checking login state");
+        setSdkError("Error checking login status. Please try again.");
+        if (onLoginFailure) onLoginFailure("Error checking login status");
       }
     };
 
     // Process the login status
     const statusChangeCallback = async (response: any) => {
       console.log('Facebook login status response:', response);
+      
+      // Check for 2FA error
+      if (response.error && is2FAError(response)) {
+        console.log('Detected 2FA challenge in the response');
+        setIs2FADetected(true);
+        if (onLoginFailure) {
+          onLoginFailure('Facebook requires two-factor authentication. Please complete the 2FA process and try again.');
+        }
+        return;
+      }
       
       try {
         const success = await handleFacebookStatusChange(response);
@@ -260,6 +271,17 @@ const FacebookLoginButton: React.FC<FacebookLoginButtonProps> = ({
   const handleSdkLogin = async () => {
     try {
       const response = await loginWithFacebook(scope);
+      
+      // Check for 2FA error
+      if (response.error && is2FAError(response)) {
+        console.log('Detected 2FA challenge during SDK login');
+        setIs2FADetected(true);
+        if (onLoginFailure) {
+          onLoginFailure('Facebook requires two-factor authentication. Please complete the 2FA process and try again.');
+        }
+        return;
+      }
+      
       if (response.status === 'connected') {
         console.log("Login successful through SDK");
         const success = await handleFacebookStatusChange(response);
@@ -276,27 +298,81 @@ const FacebookLoginButton: React.FC<FacebookLoginButtonProps> = ({
     }
   };
 
+  // Helper to handle 2FA scenarios
+  const handle2FAScenario = () => {
+    setIs2FADetected(false);
+    
+    // Save the current auth session in localStorage before redirecting
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session) {
+        // Store a minimal version of the session to maintain auth state with extended timestamp
+        // for longer validity during 2FA process
+        localStorage.setItem('fb_auth_state', JSON.stringify({
+          userId: session.user.id,
+          expiresAt: session.expires_at,
+          timestamp: Date.now()
+        }));
+      }
+      
+      // Direct OAuth flow for 2FA scenarios - this should trigger Facebook's native 2FA flow
+      const appId = window.ENV?.META_APP_ID;
+      if (!appId) {
+        setSdkError('Facebook App ID is missing. Please check your configuration.');
+        return;
+      }
+      
+      const redirectUri = encodeURIComponent(`https://crt-tech.org/oauth/facebook/callback`);
+      const loginUrl = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${redirectUri}&scope=${encodeURIComponent(scope)}&response_type=code&auth_type=rerequest`;
+      
+      console.log('Redirecting to Facebook login URL with rerequest auth type for 2FA handling:', loginUrl);
+      window.location.href = loginUrl;
+    }).catch(error => {
+      console.error('Error getting session:', error);
+      setSdkError(`Failed to prepare for Facebook login: ${error.message}`);
+    });
+  };
+
   return (
     <div className="space-y-3">
-      <div className="facebook-login-container" ref={buttonRef}>
-        {!buttonRendered && (
-          <div className="fb-button-placeholder"></div>
-        )}
-        <div 
-          id={buttonId}
-          className="fb-login-button" 
-          data-width={width}
-          data-size="large"
-          data-button-type="continue_with"
-          data-layout="rounded"
-          data-auto-logout-link={autoLogoutLink ? "true" : "false"}
-          data-use-continue-as="false"
-          data-scope={scope}
-          data-onlogin="checkLoginState();"
-        ></div>
-      </div>
+      {is2FADetected ? (
+        <div className="bg-yellow-50 border border-yellow-200 rounded p-4">
+          <div className="flex items-start">
+            <AlertTriangle className="h-5 w-5 text-yellow-400 mr-2 mt-0.5" />
+            <div>
+              <p className="text-sm font-medium text-yellow-800">Two-Factor Authentication Required</p>
+              <p className="text-sm text-yellow-700 mt-1">
+                Facebook requires you to complete two-factor authentication. Please click the button below to continue.
+              </p>
+              <button
+                onClick={handle2FAScenario}
+                className="mt-3 inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md text-white bg-yellow-600 hover:bg-yellow-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-yellow-500"
+              >
+                Continue with 2FA
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="facebook-login-container" ref={buttonRef}>
+          {!buttonRendered && (
+            <div className="fb-button-placeholder"></div>
+          )}
+          <div 
+            id={buttonId}
+            className="fb-login-button" 
+            data-width={width}
+            data-size="large"
+            data-button-type="continue_with"
+            data-layout="rounded"
+            data-auto-logout-link={autoLogoutLink ? "true" : "false"}
+            data-use-continue-as="false"
+            data-scope={scope}
+            data-onlogin="checkLoginState();"
+          ></div>
+        </div>
+      )}
       
-      {sdkError && (
+      {sdkError && !is2FADetected && (
         <div className="bg-red-50 border border-red-200 rounded p-3">
           <div className="flex items-start">
             <AlertTriangle className="h-5 w-5 text-red-400 mr-2 mt-0.5" />
