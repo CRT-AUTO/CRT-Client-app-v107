@@ -1,4 +1,4 @@
-// netlify/functions/exchangeToken.js
+// This is a Netlify serverless function that handles Facebook token exchange
 const axios = require('axios');
 
 exports.handler = async (event, context) => {
@@ -8,18 +8,18 @@ exports.handler = async (event, context) => {
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
   };
-
+  
   // Handle preflight requests
   if (event.httpMethod === 'OPTIONS') {
     return {
       statusCode: 204,
       headers
     };
-  };
-
+  }
+  
   // Extract the 'code' parameter from the query string
   const code = event.queryStringParameters?.code;
-
+  
   if (!code) {
     return {
       statusCode: 400,
@@ -31,8 +31,7 @@ exports.handler = async (event, context) => {
   // Retrieve environment variables
   const appId = process.env.VITE_META_APP_ID;
   const appSecret = process.env.META_APP_SECRET;
-  // Use an environment variable for redirectUri if provided; fallback to default
-  const redirectUri = process.env.META_REDIRECT_URI || "https://crt-tech.org/oauth/facebook/callback";
+  const redirectUri = "https://crt-tech.org/oauth/facebook/callback"; // Hardcoded to match Meta app settings
 
   // Check that required configuration is present
   if (!appId || !appSecret) {
@@ -40,7 +39,7 @@ exports.handler = async (event, context) => {
       appId: appId ? 'Set' : 'Missing',
       appSecret: appSecret ? 'Set' : 'Missing'
     });
-
+    
     return {
       statusCode: 500,
       headers,
@@ -50,10 +49,10 @@ exports.handler = async (event, context) => {
 
   try {
     console.log(`Exchanging code for token with redirect URI: ${redirectUri}`);
-
+    
     // Build the URL for token exchange following Facebook's Graph API documentation
     const tokenExchangeUrl = `https://graph.facebook.com/v18.0/oauth/access_token`;
-
+    
     // Make the server-to-server request to exchange the code for a token
     const response = await axios.get(tokenExchangeUrl, {
       params: {
@@ -64,9 +63,9 @@ exports.handler = async (event, context) => {
       },
       timeout: 10000 // 10 second timeout
     });
-
+    
     const data = response.data;
-
+    
     if (!data.access_token) {
       console.error('No access token returned from Facebook:', data);
       return {
@@ -77,7 +76,7 @@ exports.handler = async (event, context) => {
     }
 
     console.log('Successfully exchanged code for access token');
-
+    
     // Get user's Facebook pages using the new access token
     try {
       const pagesResponse = await axios.get('https://graph.facebook.com/v18.0/me/accounts', {
@@ -85,10 +84,11 @@ exports.handler = async (event, context) => {
           access_token: data.access_token
         }
       });
-
+      
       const pages = pagesResponse.data.data || [];
       console.log(`Retrieved ${pages.length} Facebook pages`);
-
+      
+      // Enhanced response with both token and pages
       return {
         statusCode: 200,
         headers,
@@ -101,7 +101,7 @@ exports.handler = async (event, context) => {
       
     } catch (pagesError) {
       console.error('Error fetching Facebook pages:', pagesError);
-
+      
       // Still return the token, but without pages
       return {
         statusCode: 200,
@@ -116,7 +116,7 @@ exports.handler = async (event, context) => {
     }
   } catch (error) {
     console.error('Exception in token exchange:', error.response?.data || error.message);
-
+    
     return {
       statusCode: 500,
       headers,
