@@ -67,6 +67,7 @@ export function initFacebookSDK(): Promise<void> {
         // Dispatch a custom event for components to listen for
         const event = new Event('fbSDKLoaded');
         document.dispatchEvent(event);
+        window.dispatchEvent(event);
         
         // Call the original fbAsyncInit if it exists
         if (typeof originalFbAsyncInit === 'function') {
@@ -75,8 +76,8 @@ export function initFacebookSDK(): Promise<void> {
         
         // Call all registered callbacks
         while (sdkReadyCallbacks.length > 0) {
-          const callback = sdkReadyCallbacks.shift();
-          if (callback) callback();
+          const cb = sdkReadyCallbacks.shift();
+          if (cb) cb();
         }
         
         resolve();
@@ -164,6 +165,11 @@ export function waitForFacebookSDK(timeoutMs: number = 10000): Promise<void> {
     
     // Clear timeout if SDK is loaded
     document.addEventListener('fbSDKLoaded', () => {
+      clearTimeout(timeoutId);
+      resolve();
+    }, { once: true });
+    
+    window.addEventListener('fbSDKLoaded', () => {
       clearTimeout(timeoutId);
       resolve();
     }, { once: true });
