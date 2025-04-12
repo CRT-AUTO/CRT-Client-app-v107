@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { supabase } from '../lib/supabase';
-import { MessageSquare, AlertCircle, Instagram } from 'lucide-react';
-import { restoreFacebookAuthState } from '../lib/facebookAuth';
+import { supabase, getSessionWithRetry } from '../lib/supabase';
+import { MessageSquare, AlertCircle, Instagram, RefreshCw } from 'lucide-react';
+import { restoreFacebookAuthState, getNetlifyFunctionsBaseUrl } from '../lib/facebookAuth';
 
 export default function InstagramCallback() {
   const [error, setError] = useState<string | null>(null);
@@ -10,21 +10,11 @@ export default function InstagramCallback() {
   const [status, setStatus] = useState<'processing' | 'auth_restore' | 'exchanging_code' | 'getting_accounts' | 'saving' | 'success' | 'error'>('processing');
   const [debugInfo, setDebugInfo] = useState<string[]>([]);
   const [authRestoreAttempted, setAuthRestoreAttempted] = useState(false);
+  const [sessionCheckFailed, setSessionCheckFailed] = useState(false);
+  const [restoreAttemptCount, setRestoreAttemptCount] = useState(0);
+  const [maxAttempts] = useState(3);
   const location = useLocation();
   const navigate = useNavigate();
-
-  // Function to determine the base URL for Netlify functions
-  const getNetlifyFunctionsBaseUrl = () => {
-    // In development or when no domain is set, use relative path
-    if (window.location.hostname === 'localhost' || 
-        window.location.hostname.includes('stackblitz') || 
-        window.location.hostname.includes('127.0.0.1')) {
-      return '/.netlify/functions';
-    }
-    
-    // In production with known domain, use the full URL
-    return 'https://crt-tech.org/.netlify/functions';
-  };
 
   const addDebugInfo = (message: string) => {
     console.log(message);
@@ -34,10 +24,11 @@ export default function InstagramCallback() {
   // First, attempt to restore authentication state
   useEffect(() => {
     const restoreAuth = async () => {
-      if (authRestoreAttempted) return;
+      if (authRestoreAttempted || restoreAttemptCount >= maxAttempts) return;
       
       addDebugInfo('Attempting to restore authentication state');
       setStatus('auth_restore');
+      setRestoreAttemptCount(prev => prev + 1);
       
       // Check if we have saved auth state
       const savedState = localStorage.getItem('fb_auth_state');
@@ -58,13 +49,19 @@ export default function InstagramCallback() {
         }
       }
       
-      // Check if we're already authenticated
-      const { data: { session } } = await supabase.auth.getSession();
-      
-      if (session) {
-        addDebugInfo(`Already authenticated as ${session.user.email || session.user.id}`);
-        setAuthRestoreAttempted(true);
-        return;
+      // Try to get session with enhanced retry logic
+      try {
+        addDebugInfo('Checking for existing session with retry mechanism');
+        const { data: { session } } = await getSessionWithRetry(20000, 1000); // Increased timeout for Instagram
+        
+        if (session) {
+          addDebugInfo(`Already authenticated as ${session.user.email || session.user.id}`);
+          setAuthRestoreAttempted(true);
+          return;
+        }
+      } catch (sessionTimeoutError) {
+        addDebugInfo(`Session check with retry failed: ${sessionTimeoutError instanceof Error ? sessionTimeoutError.message : 'Unknown error'}`);
+        setSessionCheckFailed(true);
       }
       
       try {
@@ -76,7 +73,7 @@ export default function InstagramCallback() {
           addDebugInfo('Could not restore auth state, will attempt to continue anyway');
           
           // We might need to redirect back to auth
-          if (!session) {
+          if (!sessionCheckFailed && restoreAttemptCount >= maxAttempts) {
             addDebugInfo('No active session, redirecting to auth page in 5 seconds...');
             setTimeout(() => {
               navigate('/auth', { 
@@ -96,7 +93,7 @@ export default function InstagramCallback() {
     };
     
     restoreAuth();
-  }, [navigate, authRestoreAttempted]);
+  }, [navigate, authRestoreAttempted, maxAttempts, restoreAttemptCount, sessionCheckFailed]);
 
   // Process the Instagram callback once auth restore is attempted
   useEffect(() => {
@@ -117,18 +114,58 @@ export default function InstagramCallback() {
         setStatus('processing');
 
         // Get the current user
-        const { data: userData, error: userError } = await supabase.auth.getUser();
-        if (userError) {
-          addDebugInfo(`Error getting user: ${userError.message}`);
-          throw userError;
-        }
-        
-        if (!userData.user) {
-          addDebugInfo('User not authenticated');
-          throw new Error('User not authenticated');
+        let userData;
+        try {
+          const { data, error: userError } = await supabase.auth.getUser();
+          if (userError) {
+            addDebugInfo(`Error getting user: ${userError.message}`);
+            throw userError;
+          }
+          
+          if (!data.user) {
+            addDebugInfo('User not authenticated');
+            
+            // If session check failed, try to use saved state
+            if (sessionCheckFailed) {
+              const savedState = localStorage.getItem('fb_auth_state');
+              if (savedState) {
+                try {
+                  const parsedState = JSON.parse(savedState);
+                  addDebugInfo(`Using saved user ID from auth state: ${parsedState.userId?.slice(0, 8) || 'unknown'}...`);
+                  userData = { user: { id: parsedState.userId } };
+                } catch (parseError) {
+                  throw new Error('User not authenticated and could not restore from saved state');
+                }
+              } else {
+                throw new Error('User not authenticated and no saved state found');
+              }
+            } else {
+              throw new Error('User not authenticated');
+            }
+          } else {
+            userData = data;
+          }
+        } catch (userError) {
+          // Try to get user ID from saved state
+          const savedState = localStorage.getItem('fb_auth_state');
+          if (!savedState) {
+            throw new Error('User not authenticated and no saved state found');
+          }
+          
+          try {
+            const parsedState = JSON.parse(savedState);
+            if (!parsedState.userId) {
+              throw new Error('Invalid saved state: missing userId');
+            }
+            addDebugInfo(`Using user ID from saved state: ${parsedState.userId.slice(0, 8)}...`);
+            userData = { user: { id: parsedState.userId } };
+          } catch (parseError) {
+            throw new Error('User not authenticated and could not restore from saved state');
+          }
         }
 
-        addDebugInfo(`Authenticated as user ID: ${userData.user.id}`);
+        const userId = userData.user.id;
+        addDebugInfo(`Using user ID: ${userId}`);
 
         // Exchange code for token using our Netlify function
         setStatus('exchanging_code');
@@ -260,6 +297,10 @@ export default function InstagramCallback() {
         
         const longLivedTokenData = await longLivedTokenResponse.json();
         
+        if (!longLivedTokenData.accessToken) {
+          throw new Error('No long-lived access token returned from server');
+        }
+        
         // Calculate token expiry date - use 60 days if not specified
         const expiryDate = longLivedTokenData.expiryDate || 
                           new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
@@ -268,50 +309,67 @@ export default function InstagramCallback() {
         setStatus('saving');
         addDebugInfo('Saving Instagram connection to database...');
         
-        // Check for existing connection
-        const { data: existingConnections, error: connectionError } = await supabase
-          .from('social_connections')
-          .select('*')
-          .eq('user_id', userData.user.id)
-          .eq('ig_account_id', instagramAccount.id);
+        try {
+          // Check for existing connection
+          const { data: existingConnections, error: connectionError } = await supabase
+            .from('social_connections')
+            .select('*')
+            .eq('user_id', userId)
+            .eq('ig_account_id', instagramAccount.id);
+            
+          if (connectionError) {
+            addDebugInfo(`Error checking existing connections: ${connectionError.message}`);
+            throw connectionError;
+          }
           
-        if (connectionError) {
-          addDebugInfo(`Error checking existing connections: ${connectionError.message}`);
-          throw connectionError;
-        }
-        
-        if (existingConnections && existingConnections.length > 0) {
-          // Update existing connection
-          addDebugInfo('Updating existing Instagram connection');
-          const { error: updateError } = await supabase
-            .from('social_connections')
-            .update({
-              access_token: longLivedTokenData.accessToken,
-              token_expiry: expiryDate,
-              refreshed_at: new Date().toISOString()
-            })
-            .eq('id', existingConnections[0].id);
-            
-          if (updateError) {
-            addDebugInfo(`Error updating connection: ${updateError.message}`);
-            throw updateError;
+          if (existingConnections && existingConnections.length > 0) {
+            // Update existing connection
+            addDebugInfo('Updating existing Instagram connection');
+            const { error: updateError } = await supabase
+              .from('social_connections')
+              .update({
+                access_token: longLivedTokenData.accessToken,
+                token_expiry: expiryDate,
+                refreshed_at: new Date().toISOString()
+              })
+              .eq('id', existingConnections[0].id);
+              
+            if (updateError) {
+              addDebugInfo(`Error updating connection: ${updateError.message}`);
+              throw updateError;
+            }
+          } else {
+            // Create new connection
+            addDebugInfo('Creating new Instagram connection');
+            const { error: insertError } = await supabase
+              .from('social_connections')
+              .insert({
+                user_id: userId,
+                ig_account_id: instagramAccount.id,
+                access_token: longLivedTokenData.accessToken,
+                token_expiry: expiryDate
+              });
+              
+            if (insertError) {
+              addDebugInfo(`Error creating connection: ${insertError.message}`);
+              throw insertError;
+            }
           }
-        } else {
-          // Create new connection
-          addDebugInfo('Creating new Instagram connection');
-          const { error: insertError } = await supabase
-            .from('social_connections')
-            .insert({
-              user_id: userData.user.id,
-              ig_account_id: instagramAccount.id,
-              access_token: longLivedTokenData.accessToken,
-              token_expiry: expiryDate
-            });
+        } catch (dbError) {
+          // Handle database errors
+          addDebugInfo(`Database operation failed: ${dbError instanceof Error ? dbError.message : 'Unknown error'}`);
+          
+          // Special case: If we're in a 2FA flow and can't authenticate properly,
+          // we might not be able to save the connection
+          if (sessionCheckFailed) {
+            addDebugInfo('Session check failed and we are likely in a 2FA flow.');
+            addDebugInfo('Consider redirecting user to login again after 2FA completion.');
             
-          if (insertError) {
-            addDebugInfo(`Error creating connection: ${insertError.message}`);
-            throw insertError;
+            // Provide clearer error message for 2FA scenario
+            throw new Error('Could not save connection due to authentication issues. Please log in again after completing two-factor authentication.');
           }
+          
+          throw dbError;
         }
         
         // Clean up storage
@@ -328,14 +386,36 @@ export default function InstagramCallback() {
       } catch (err) {
         console.error('Instagram OAuth Error:', err);
         addDebugInfo(`Instagram OAuth Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
-        setError('Failed to connect your Instagram account. Please try again.');
+        
+        // Special handling for 2FA-related errors
+        if (err instanceof Error && (
+            err.message.includes('two-factor') || 
+            err.message.includes('2FA') || 
+            err.message.includes('authentication')
+        )) {
+          setError('Facebook requires two-factor authentication. Please complete the 2FA process and try again.');
+        } else {
+          setError('Failed to connect your Instagram account. Please try again.');
+        }
+        
         setStatus('error');
         setProcessing(false);
       }
     }
 
     handleInstagramCallback();
-  }, [location, navigate, authRestoreAttempted]);
+  }, [location, navigate, authRestoreAttempted, sessionCheckFailed]);
+
+  // Function to retry the entire process
+  const handleRetry = () => {
+    // Reset all state
+    setAuthRestoreAttempted(false);
+    setRestoreAttemptCount(0);
+    setSessionCheckFailed(false);
+    setStatus('processing');
+    setError(null);
+    setProcessing(true);
+  };
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8">
@@ -365,6 +445,18 @@ export default function InstagramCallback() {
               <p className="text-sm text-gray-500 mt-2">
                 This might take a moment.
               </p>
+              
+              {sessionCheckFailed && (
+                <div className="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded-md">
+                  <p className="flex items-center text-sm text-yellow-700">
+                    <AlertCircle className="h-4 w-4 mr-1" />
+                    It looks like Facebook might be requiring two-factor authentication.
+                  </p>
+                  <p className="mt-1 text-xs text-yellow-600">
+                    If you're completing 2FA on Facebook, please wait while we process your connection.
+                  </p>
+                </div>
+              )}
             </>
           ) : status === 'error' ? (
             <>
@@ -374,12 +466,23 @@ export default function InstagramCallback() {
               <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 mb-4 rounded-md text-sm">
                 {error}
               </div>
-              <button
-                onClick={() => navigate('/settings')}
-                className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
-              >
-                Go Back to Settings
-              </button>
+              
+              <div className="mt-4 flex flex-col sm:flex-row gap-2 justify-center">
+                <button
+                  onClick={handleRetry}
+                  className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                >
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                  Try Again
+                </button>
+                
+                <button
+                  onClick={() => navigate('/settings')}
+                  className="inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md shadow-sm text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                >
+                  Go Back to Settings
+                </button>
+              </div>
             </>
           ) : (
             <>
