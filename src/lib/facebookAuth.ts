@@ -13,6 +13,13 @@ export interface FacebookAuthResponse {
 export interface FacebookStatusResponse {
   status: 'connected' | 'not_authorized' | 'unknown' | 'error';
   authResponse: FacebookAuthResponse | null;
+  error?: {
+    message?: string;
+    type?: string;
+    code?: number;
+    errorSummary?: string;
+    errorSubcode?: number;
+  };
 }
 
 export interface FacebookPage {
@@ -21,6 +28,23 @@ export interface FacebookPage {
   access_token: string;
   category: string;
   tasks?: string[];
+}
+
+// Special error codes for Facebook 2FA
+export const FB_2FA_ERROR_CODE = 1357004;
+export const FB_2FA_ERROR_SUBCODE = 1357045;
+
+/**
+ * Check if the error response is a 2FA error
+ */
+export function is2FAError(response: any): boolean {
+  return (
+    response?.error?.code === FB_2FA_ERROR_CODE ||
+    response?.error?.errorSubcode === FB_2FA_ERROR_SUBCODE ||
+    (response?.error?.errorSummary && response?.error?.errorSummary.includes('2-factor')) ||
+    (response?.error?.message && response?.error?.message.includes('two-factor')) ||
+    (response?.error?.message && response?.error?.message.includes('2FA'))
+  );
 }
 
 // Function to check Facebook login status
@@ -47,7 +71,7 @@ export async function statusChangeCallback(response: FacebookStatusResponse): Pr
 }
 
 // Function to determine the base URL for Netlify functions
-function getNetlifyFunctionsBaseUrl() {
+export function getNetlifyFunctionsBaseUrl() {
   // In development or when no domain is set, use relative path
   if (window.location.hostname === 'localhost' || 
       window.location.hostname.includes('stackblitz') || 
@@ -139,6 +163,16 @@ export function handleFacebookStatusChange(response: FacebookStatusResponse): Pr
       // User is logged into Facebook but has not authorized the app
       console.log('Not authorized: User is logged into Facebook but has not authorized the app');
       
+      // Check if this appears to be a 2FA challenge
+      if (is2FAError(response)) {
+        console.log('Detected possible 2FA challenge, showing message to user');
+        // In a real implementation, you might show a special message to the user
+        // informing them about the 2FA challenge and providing guidance
+        
+        // Still proceed with the OAuth flow, but let the caller know this is a 2FA situation
+        resolve(false);
+      }
+      
       // Save current auth state
       try {
         const { data: { session } } = await supabase.auth.getSession();
@@ -216,7 +250,7 @@ export async function checkLoginState(): Promise<void> {
 }
 
 // Function to initiate Facebook login
-export async function loginWithFacebook(): Promise<FacebookStatusResponse> {
+export async function loginWithFacebook(scope: string = "public_profile,email,pages_show_list,pages_messaging"): Promise<FacebookStatusResponse> {
   try {
     // Ensure SDK is ready
     await waitForFacebookSDK();
@@ -224,6 +258,15 @@ export async function loginWithFacebook(): Promise<FacebookStatusResponse> {
     return new Promise((resolve) => {
       window.FB.login((response) => {
         console.log("Facebook login response:", response);
+        
+        // Check for 2FA error
+        if (response.error && is2FAError(response)) {
+          console.log("Detected 2FA challenge during login");
+          response.status = 'error';
+          resolve(response as FacebookStatusResponse);
+          return;
+        }
+        
         if (response.status === 'connected') {
           // Successful login, resolve with the response
           resolve(response as FacebookStatusResponse);
@@ -232,7 +275,7 @@ export async function loginWithFacebook(): Promise<FacebookStatusResponse> {
           console.log("Facebook login was not successful:", response);
           resolve(response as FacebookStatusResponse);
         }
-      }, { scope: 'public_profile,email,pages_show_list,pages_messaging', auth_type: 'rerequest' });
+      }, { scope, auth_type: 'rerequest' });
     });
   } catch (error) {
     console.error('Error initiating Facebook login:', error);
