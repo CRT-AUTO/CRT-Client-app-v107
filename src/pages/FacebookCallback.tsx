@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { supabase } from '../lib/supabase';
-import { MessageSquare, AlertCircle, Facebook } from 'lucide-react';
-import { restoreFacebookAuthState } from '../lib/facebookAuth';
+import { supabase, getSessionWithRetry } from '../lib/supabase';
+import { MessageSquare, AlertCircle, Facebook, RefreshCw } from 'lucide-react';
+import { restoreFacebookAuthState, is2FAError, getNetlifyFunctionsBaseUrl } from '../lib/facebookAuth';
 
 // Type definition for Facebook Page
 interface FacebookPage {
@@ -22,21 +22,9 @@ export default function FacebookCallback() {
   const [authRestoreAttempted, setAuthRestoreAttempted] = useState(false);
   const [maxAttempts] = useState(3); // Maximum number of auth restore attempts
   const [restoreAttemptCount, setRestoreAttemptCount] = useState(0);
+  const [sessionCheckFailed, setSessionCheckFailed] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
-
-  // Function to determine the base URL for Netlify functions
-  const getNetlifyFunctionsBaseUrl = () => {
-    // In development or when no domain is set, use relative path
-    if (window.location.hostname === 'localhost' || 
-        window.location.hostname.includes('stackblitz') || 
-        window.location.hostname.includes('127.0.0.1')) {
-      return '/.netlify/functions';
-    }
-    
-    // In production with known domain, use the full URL
-    return 'https://crt-tech.org/.netlify/functions';
-  };
 
   const addDebugInfo = (message: string) => {
     console.log(message);
@@ -79,17 +67,19 @@ export default function FacebookCallback() {
       
       // First check if we're already authenticated
       try {
-        const { data: { session }, error } = await supabase.auth.getSession();
-        
-        if (error) {
-          addDebugInfo(`Error checking session: ${error.message}`);
-          throw error;
-        }
-        
-        if (session) {
-          addDebugInfo(`Already authenticated as ${session.user.email || session.user.id}`);
-          setAuthRestoreAttempted(true);
-          return;
+        // Use enhanced session check with retry for 2FA scenarios
+        addDebugInfo('Checking for existing session with retry mechanism');
+        try {
+          const { data: { session } } = await getSessionWithRetry(20000, 1000); // Increased to 20 seconds for 2FA
+          
+          if (session) {
+            addDebugInfo(`Already authenticated as ${session.user.email || session.user.id}`);
+            setAuthRestoreAttempted(true);
+            return;
+          }
+        } catch (sessionTimeoutError) {
+          addDebugInfo(`Session check with retry failed: ${sessionTimeoutError instanceof Error ? sessionTimeoutError.message : 'Unknown error'}`);
+          setSessionCheckFailed(true);
         }
 
         addDebugInfo('No active session found, attempting to restore');
@@ -156,19 +146,68 @@ export default function FacebookCallback() {
         addDebugInfo(`Processing Facebook callback with code: ${code.substring(0, 10)}...`);
         setStatus('processing');
 
-        // Get the current user
-        const { data: userData, error: userError } = await supabase.auth.getUser();
-        if (userError) {
-          addDebugInfo(`Error getting user: ${userError.message}`);
-          throw userError;
-        }
-        
-        if (!userData.user) {
-          addDebugInfo('User not authenticated');
-          throw new Error('User not authenticated');
+        // Special handling for possible 2FA scenario
+        if (sessionCheckFailed) {
+          addDebugInfo('Session check failed previously, which may indicate a 2FA flow');
+          // We'll still attempt to proceed with the token exchange
         }
 
-        addDebugInfo(`Authenticated as user ID: ${userData.user.id}`);
+        // Get the current user
+        let userData;
+        try {
+          const { data, error: userError } = await supabase.auth.getUser();
+          if (userError) {
+            addDebugInfo(`Error getting user: ${userError.message}`);
+            throw userError;
+          }
+          
+          if (!data.user) {
+            addDebugInfo('User not authenticated');
+            // If session check failed and we can't get the user, this may be a 2FA flow
+            // We'll try to restore from saved state
+            if (sessionCheckFailed) {
+              const savedState = localStorage.getItem('fb_auth_state');
+              if (savedState) {
+                try {
+                  const parsedState = JSON.parse(savedState);
+                  addDebugInfo(`Using saved user ID from auth state: ${parsedState.userId?.slice(0, 8) || 'unknown'}...`);
+                  userData = { user: { id: parsedState.userId } };
+                } catch (parseError) {
+                  addDebugInfo(`Error parsing saved auth state: ${parseError instanceof Error ? parseError.message : 'Unknown error'}`);
+                  throw new Error('User not authenticated and could not restore from saved state');
+                }
+              } else {
+                throw new Error('User not authenticated');
+              }
+            } else {
+              throw new Error('User not authenticated');
+            }
+          } else {
+            userData = data;
+          }
+        } catch (userError) {
+          addDebugInfo(`Error getting authenticated user: ${userError instanceof Error ? userError.message : 'Unknown error'}`);
+          // Try to get user ID from saved state
+          const savedState = localStorage.getItem('fb_auth_state');
+          if (!savedState) {
+            throw new Error('User not authenticated and no saved state found');
+          }
+          
+          try {
+            const parsedState = JSON.parse(savedState);
+            if (!parsedState.userId) {
+              throw new Error('Invalid saved state: missing userId');
+            }
+            addDebugInfo(`Using user ID from saved state: ${parsedState.userId.slice(0, 8)}...`);
+            userData = { user: { id: parsedState.userId } };
+          } catch (parseError) {
+            addDebugInfo(`Error parsing saved auth state: ${parseError instanceof Error ? parseError.message : 'Unknown error'}`);
+            throw new Error('User not authenticated and could not restore from saved state');
+          }
+        }
+
+        const userId = userData.user.id;
+        addDebugInfo(`Authenticated as user ID: ${userId}`);
 
         // Exchange code for token using our Netlify function
         setStatus('exchanging_code');
@@ -261,6 +300,8 @@ export default function FacebookCallback() {
           selectedPageId = pages[0].id;
           selectedPage = pages[0];
           addDebugInfo(`Multiple pages available, selecting first one: ${selectedPage.name}`);
+          // Save all pages to state in case we want to implement selection UI
+          setAvailablePages(pages);
         } else {
           throw new Error('No Facebook pages available');
         }
@@ -294,50 +335,67 @@ export default function FacebookCallback() {
         setStatus('saving');
         addDebugInfo('Saving Facebook connection to database...');
         
-        // Check for existing connection
-        const { data: existingConnections, error: connectionError } = await supabase
-          .from('social_connections')
-          .select('*')
-          .eq('user_id', userData.user.id)
-          .eq('fb_page_id', selectedPageId);
+        try {
+          // Check for existing connection
+          const { data: existingConnections, error: connectionError } = await supabase
+            .from('social_connections')
+            .select('*')
+            .eq('user_id', userId)
+            .eq('fb_page_id', selectedPageId);
+            
+          if (connectionError) {
+            addDebugInfo(`Error checking existing connections: ${connectionError.message}`);
+            throw connectionError;
+          }
           
-        if (connectionError) {
-          addDebugInfo(`Error checking existing connections: ${connectionError.message}`);
-          throw connectionError;
-        }
-        
-        if (existingConnections && existingConnections.length > 0) {
-          // Update existing connection
-          addDebugInfo('Updating existing Facebook connection');
-          const { error: updateError } = await supabase
-            .from('social_connections')
-            .update({
-              access_token: pageAccessToken,
-              token_expiry: expiryDate,
-              refreshed_at: new Date().toISOString()
-            })
-            .eq('id', existingConnections[0].id);
-            
-          if (updateError) {
-            addDebugInfo(`Error updating connection: ${updateError.message}`);
-            throw updateError;
+          if (existingConnections && existingConnections.length > 0) {
+            // Update existing connection
+            addDebugInfo('Updating existing Facebook connection');
+            const { error: updateError } = await supabase
+              .from('social_connections')
+              .update({
+                access_token: pageAccessToken,
+                token_expiry: expiryDate,
+                refreshed_at: new Date().toISOString()
+              })
+              .eq('id', existingConnections[0].id);
+              
+            if (updateError) {
+              addDebugInfo(`Error updating connection: ${updateError.message}`);
+              throw updateError;
+            }
+          } else {
+            // Create new connection
+            addDebugInfo('Creating new Facebook connection');
+            const { error: insertError } = await supabase
+              .from('social_connections')
+              .insert({
+                user_id: userId,
+                fb_page_id: selectedPageId,
+                access_token: pageAccessToken,
+                token_expiry: expiryDate
+              });
+              
+            if (insertError) {
+              addDebugInfo(`Error creating connection: ${insertError.message}`);
+              throw insertError;
+            }
           }
-        } else {
-          // Create new connection
-          addDebugInfo('Creating new Facebook connection');
-          const { error: insertError } = await supabase
-            .from('social_connections')
-            .insert({
-              user_id: userData.user.id,
-              fb_page_id: selectedPageId,
-              access_token: pageAccessToken,
-              token_expiry: expiryDate
-            });
+        } catch (dbError) {
+          // Handle database errors
+          addDebugInfo(`Database operation failed: ${dbError instanceof Error ? dbError.message : 'Unknown error'}`);
+          
+          // Special case: If we're in a 2FA flow and can't authenticate properly,
+          // we might not be able to save the connection
+          if (sessionCheckFailed) {
+            addDebugInfo('Session check failed and we are likely in a 2FA flow.');
+            addDebugInfo('Consider redirecting user to login again after 2FA completion.');
             
-          if (insertError) {
-            addDebugInfo(`Error creating connection: ${insertError.message}`);
-            throw insertError;
+            // Provide clearer error message for 2FA scenario
+            throw new Error('Could not save connection due to authentication issues. Please log in again after completing two-factor authentication.');
           }
+          
+          throw dbError;
         }
         
         // Clean up storage
@@ -355,14 +413,36 @@ export default function FacebookCallback() {
       } catch (err) {
         console.error('Facebook OAuth Error:', err);
         addDebugInfo(`Facebook OAuth Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
-        setError('Failed to connect your Facebook account. Please try again.');
+        
+        // Special handling for 2FA-related errors
+        if (err instanceof Error && (
+            err.message.includes('two-factor') || 
+            err.message.includes('2FA') || 
+            err.message.includes('authentication')
+        )) {
+          setError('Facebook requires two-factor authentication. Please complete the 2FA process and try again.');
+        } else {
+          setError('Failed to connect your Facebook account. Please try again.');
+        }
+        
         setStatus('error');
         setProcessing(false);
       }
     }
 
     handleFacebookCallback();
-  }, [location, navigate, authRestoreAttempted]);
+  }, [location, navigate, authRestoreAttempted, sessionCheckFailed]);
+
+  // Function to retry the entire process
+  const handleRetry = () => {
+    // Reset all state
+    setAuthRestoreAttempted(false);
+    setRestoreAttemptCount(0);
+    setSessionCheckFailed(false);
+    setStatus('processing');
+    setError(null);
+    setProcessing(true);
+  };
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8">
@@ -392,6 +472,18 @@ export default function FacebookCallback() {
               <p className="text-sm text-gray-500 mt-2">
                 This might take a moment.
               </p>
+              
+              {sessionCheckFailed && (
+                <div className="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded-md">
+                  <p className="flex items-center text-sm text-yellow-700">
+                    <AlertCircle className="h-4 w-4 mr-1" />
+                    It looks like Facebook might be requiring two-factor authentication.
+                  </p>
+                  <p className="mt-1 text-xs text-yellow-600">
+                    If you're completing 2FA on Facebook, please wait while we process your connection.
+                  </p>
+                </div>
+              )}
             </>
           ) : status === 'error' ? (
             <>
@@ -401,12 +493,23 @@ export default function FacebookCallback() {
               <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 mb-4 rounded-md text-sm">
                 {error}
               </div>
-              <button
-                onClick={() => navigate('/settings')}
-                className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
-              >
-                Go Back to Settings
-              </button>
+              
+              <div className="mt-4 flex flex-col sm:flex-row gap-2 justify-center">
+                <button
+                  onClick={handleRetry}
+                  className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                >
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                  Try Again
+                </button>
+                
+                <button
+                  onClick={() => navigate('/settings')}
+                  className="inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md shadow-sm text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                >
+                  Go Back to Settings
+                </button>
+              </div>
             </>
           ) : (
             <>
