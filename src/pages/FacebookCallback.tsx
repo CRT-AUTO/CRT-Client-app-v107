@@ -23,6 +23,7 @@ export default function FacebookCallback() {
   const [maxAttempts] = useState(3); // Maximum number of auth restore attempts
   const [restoreAttemptCount, setRestoreAttemptCount] = useState(0);
   const [sessionCheckFailed, setSessionCheckFailed] = useState(false);
+  const [noPageDetected, setNoPageDetected] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -30,6 +31,25 @@ export default function FacebookCallback() {
     console.log(message);
     setDebugInfo(prev => [...prev, `${new Date().toISOString().slice(11, 19)}: ${message}`]);
   };
+
+  // Check for OAuth cancellation/errors in URL
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const error = params.get('error');
+    const errorReason = params.get('error_reason');
+    const errorDescription = params.get('error_description');
+    
+    if (error) {
+      addDebugInfo(`OAuth error detected in URL: ${error}`);
+      if (errorReason) addDebugInfo(`Error reason: ${errorReason}`);
+      if (errorDescription) addDebugInfo(`Error description: ${errorDescription}`);
+      
+      setError(`Facebook login was cancelled or failed: ${errorDescription || errorReason || error}`);
+      setStatus('error');
+      setProcessing(false);
+      return;
+    }
+  }, [location.search]);
 
   // First, attempt to restore authentication state
   useEffect(() => {
@@ -48,11 +68,11 @@ export default function FacebookCallback() {
           const parsedState = JSON.parse(savedState);
           addDebugInfo(`Found saved auth state for user ${parsedState.userId?.slice(0, 8) || 'unknown'}...`);
           
-          // Check if the state is recent enough (less than 15 minutes old)
+          // Check if the state is recent enough (less than 30 minutes old - increased from 15)
           const stateAgeMinutes = (Date.now() - parsedState.timestamp) / (60 * 1000);
           addDebugInfo(`Auth state is ${stateAgeMinutes.toFixed(1)} minutes old`);
           
-          if (stateAgeMinutes > 15) {
+          if (stateAgeMinutes > 30) {
             addDebugInfo('Auth state is too old, removing it');
             localStorage.removeItem('fb_auth_state');
           }
@@ -67,10 +87,10 @@ export default function FacebookCallback() {
       
       // First check if we're already authenticated
       try {
-        // Use enhanced session check with retry for 2FA scenarios
-        addDebugInfo('Checking for existing session with retry mechanism');
+        // Use enhanced session check with retry for 2FA scenarios - increased timeout to 30 seconds
+        addDebugInfo('Checking for existing session with retry mechanism (30s timeout)');
         try {
-          const { data: { session } } = await getSessionWithRetry(20000, 1000); // Increased to 20 seconds for 2FA
+          const { data: { session } } = await getSessionWithRetry(30000, 1500); // Increased to 30 seconds for 2FA
           
           if (session) {
             addDebugInfo(`Already authenticated as ${session.user.email || session.user.id}`);
@@ -93,8 +113,7 @@ export default function FacebookCallback() {
           } else {
             addDebugInfo('Could not restore authentication state, will attempt to continue anyway');
             
-            // We might need to redirect back to auth
-            // We'll do this after processing the token exchange
+            // We'll still proceed with the token exchange even without a session
             setAuthRestoreAttempted(true);
           }
         } catch (restoreError) {
@@ -102,15 +121,8 @@ export default function FacebookCallback() {
           
           // If we've reached max attempts, redirect to auth
           if (restoreAttemptCount >= maxAttempts) {
-            addDebugInfo(`Max restore attempts (${maxAttempts}) reached, redirecting to auth`);
-            setTimeout(() => {
-              navigate('/auth', { 
-                state: { 
-                  message: 'Failed to restore session. Please log in again to complete Facebook connection.',
-                  fromOAuth: true 
-                } 
-              });
-            }, 3000);
+            addDebugInfo(`Max restore attempts (${maxAttempts}) reached, but will still attempt to continue`);
+            setAuthRestoreAttempted(true); // Continue anyway as a last resort
           } else {
             // Try again after a delay
             setTimeout(() => {
@@ -284,7 +296,9 @@ export default function FacebookCallback() {
         }
         
         if (pages.length === 0) {
-          throw new Error('No Facebook pages available for this account. Please create a Facebook page first.');
+          addDebugInfo('No Facebook pages found. User needs to create a Facebook page first.');
+          setNoPageDetected(true);
+          throw new Error('No Facebook pages available for this account. Please create a Facebook page first, then try connecting again.');
         }
         
         // If we have exactly one page, use it directly
@@ -421,6 +435,8 @@ export default function FacebookCallback() {
             err.message.includes('authentication')
         )) {
           setError('Facebook requires two-factor authentication. Please complete the 2FA process and try again.');
+        } else if (noPageDetected) {
+          setError('No Facebook Pages found on your account. Please create a Facebook Page first, then try connecting again.');
         } else {
           setError('Failed to connect your Facebook account. Please try again.');
         }
@@ -431,7 +447,7 @@ export default function FacebookCallback() {
     }
 
     handleFacebookCallback();
-  }, [location, navigate, authRestoreAttempted, sessionCheckFailed]);
+  }, [location, navigate, authRestoreAttempted, sessionCheckFailed, noPageDetected]);
 
   // Function to retry the entire process
   const handleRetry = () => {
@@ -439,9 +455,15 @@ export default function FacebookCallback() {
     setAuthRestoreAttempted(false);
     setRestoreAttemptCount(0);
     setSessionCheckFailed(false);
+    setNoPageDetected(false);
     setStatus('processing');
     setError(null);
     setProcessing(true);
+  };
+
+  // Function to create a Facebook page
+  const goToCreateFacebookPage = () => {
+    window.open('https://www.facebook.com/pages/create/', '_blank');
   };
 
   return (
@@ -470,7 +492,7 @@ export default function FacebookCallback() {
                 {status === 'saving' && 'Saving your Facebook page connection...'}
               </p>
               <p className="text-sm text-gray-500 mt-2">
-                This might take a moment.
+                {sessionCheckFailed ? 'This might take a bit longer than usual. Please be patient.' : 'This might take a moment.'}
               </p>
               
               {sessionCheckFailed && (
@@ -495,20 +517,41 @@ export default function FacebookCallback() {
               </div>
               
               <div className="mt-4 flex flex-col sm:flex-row gap-2 justify-center">
-                <button
-                  onClick={handleRetry}
-                  className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
-                >
-                  <RefreshCw className="h-4 w-4 mr-2" />
-                  Try Again
-                </button>
-                
-                <button
-                  onClick={() => navigate('/settings')}
-                  className="inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md shadow-sm text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
-                >
-                  Go Back to Settings
-                </button>
+                {noPageDetected ? (
+                  <>
+                    <button
+                      onClick={goToCreateFacebookPage}
+                      className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+                    >
+                      <Facebook className="h-4 w-4 mr-2" />
+                      Create Facebook Page
+                    </button>
+                    
+                    <button
+                      onClick={() => navigate('/settings')}
+                      className="inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md shadow-sm text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                    >
+                      Go Back to Settings
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      onClick={handleRetry}
+                      className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                    >
+                      <RefreshCw className="h-4 w-4 mr-2" />
+                      Try Again
+                    </button>
+                    
+                    <button
+                      onClick={() => navigate('/settings')}
+                      className="inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md shadow-sm text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                    >
+                      Go Back to Settings
+                    </button>
+                  </>
+                )}
               </div>
             </>
           ) : (
